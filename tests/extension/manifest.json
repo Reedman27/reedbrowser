@@ -1,0 +1,4 @@
+{"manifest_version":2,"name":"Reed Test Ext","version":"1.0","browser_specific_settings":{"gecko":{"id":"reedtest@example.org"}},
+ "permissions":["storage","tabs","<all_urls>"],
+ "background":{"scripts":["bg.js"]},
+ "content_scripts":[{"matches":["http://127.0.0.1/*"],"js":["content.js"],"css":["c.css"],"run_at":"document_end"}]}

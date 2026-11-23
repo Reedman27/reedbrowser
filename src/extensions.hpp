@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 ReedBrowser contributors
+//
+// WebExtensions runtime for ReedBrowser (Firefox-style `browser.*` / `chrome.*`).
+//
+// WebKitGTK only parses manifests and match patterns; everything else lives here:
+// the extension registry and installer, the moz-extension:// file scheme, a hidden
+// background page per extension, content-script injection into an isolated JS world,
+// and a native bridge for runtime messaging, storage and tabs.
+// See docs/EXTENSIONS.md for what is and is not supported.
+#pragma once
+
+#include <webkit/webkit.h>
+
+#include <functional>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+class ExtensionManager {
+public:
+    struct TabInfo {
+        int id = 0;
+        std::string url, title;
+        bool active = false;
+    };
+    // The browser supplies its tab model; the runtime never touches browser internals.
+    struct Host {
+        std::function<std::vector<TabInfo>()> list_tabs;
+        std::function<int(const std::string &url, bool active)> open_tab;  // returns new tab id
+        std::function<void(int id)> close_tab;
+        std::function<void(int id)> activate_tab;
+    };
+
+    ExtensionManager(std::string data_dir, WebKitNetworkSession *session, Host host);
+    ~ExtensionManager();
+
+    // CLI-side management (no display needed).
+    bool install(const std::string &path, bool assume_yes, std::string *message);
+    bool remove(const std::string &id_or_name, std::string *message);
+    std::string describe() const;  // human-readable list
+
+    // Runtime (needs GTK/WebKit running).
+    void start();                                       // register scheme, start background pages
+    void attach_view(WebKitWebView *view, WebKitUserContentManager *ucm, int tab_id, bool is_private);
+    void detach_view(WebKitWebView *view);
+    void tab_created(int id);
+    void tab_removed(int id);
+    void tab_activated(int id);
+    void tab_updated(int id, const std::string &status, const std::string &url, const std::string &title);
+    int extension_count() const;
+
+    struct Impl;
+private:
+    std::unique_ptr<Impl> d_;
+};
