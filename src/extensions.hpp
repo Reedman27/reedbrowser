@@ -53,6 +53,18 @@ public:
     void tab_updated(int id, const std::string &status, const std::string &url, const std::string &title);
     int extension_count() const;
 
+    // Toolbar buttons, popups, options pages, management UI.
+    struct ActionInfo { std::string uuid, name, title, badge, badge_color, icon_path, popup; };
+    struct Summary { std::string uuid, id, name, version; bool enabled; bool has_options; };
+    std::vector<ActionInfo> actions() const;
+    std::vector<Summary> list() const;
+    WebKitWebView *create_popup(const std::string &uuid);    // nullptr if the extension has no popup; floating widget
+    WebKitWebView *create_options(const std::string &uuid);  // nullptr if none; floating widget
+    void action_clicked(const std::string &uuid, int tab_id);  // for buttons without a popup
+    void set_ui_callbacks(std::function<void()> actions_changed, std::function<void(const std::string &uuid)> open_options);
+    void start_new();                                    // start extensions installed while running
+    void set_enabled(const std::string &uuid, bool on);  // content scripts follow after a restart
+
     struct Impl;
 private:
     std::unique_ptr<Impl> d_;

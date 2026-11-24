@@ -74,6 +74,7 @@ struct Browser {
     std::string download_dir;
     bool shutting_down{false};
     GtkWidget *manager_win{};   // bookmark manager window, if open
+    GtkWidget *ext_box{};       // toolbar container for extension buttons
     std::string home_token;     // per-session secret so web pages cannot forge reed:// actions
 };
 
@@ -82,6 +83,9 @@ static void bookmarks_changed(Browser *b);
 static void show_bookmark_manager(Browser *b);
 static void show_bookmark_editor(Browser *b, long long id);
 static void show_import_wizard(Browser *b);
+static void refresh_extension_buttons(Browser *b);
+static void open_extension_options(Browser *b, const std::string &uuid);
+static void show_extension_manager(Browser *b);
 static void start_extension_install(Browser *b, WebKitWebView *origin, const std::string &source, int install_id);
 static void attach_amo_support(Browser *b, WebKitWebView *view, WebKitUserContentManager *ucm);
 static gboolean on_decide_policy(WebKitWebView *view, WebKitPolicyDecision *decision, WebKitPolicyDecisionType type, gpointer data);
@@ -779,6 +783,7 @@ static void confirm_extension_install(GtkButton *, gpointer data) {
     auto *c = static_cast<InstallConfirm *>(data);
     Browser *browser = c->browser; GtkWidget *window = c->window; std::string source = c->source;
     std::string msg; bool ok = browser->ext && browser->ext->install(source, true, &msg);
+    if (ok) browser->ext->start_new();
     gtk_window_destroy(GTK_WINDOW(window));
     extension_message(browser, ok ? "Extension installed" : "Installation failed", msg + (ok ? "\n\nRestart ReedBrowser to load it." : ""));
 }
@@ -1133,9 +1138,10 @@ static void install_download_done(GObject *, GAsyncResult *, gpointer data) {
         WebKitWebView *v = job->view_ref ? WEBKIT_WEB_VIEW(job->view_ref) : nullptr;
         amo_event(v, job->install_id, "onInstallStarted");
         std::string msg; bool ok = job->browser->ext && job->browser->ext->install(job->temp, true, &msg);
+        if (ok) job->browser->ext->start_new();
         amo_event(v, job->install_id, ok ? "onInstallEnded" : "onInstallFailed");
         set_status(job->browser, ok ? "Extension installed." : "Extension install failed.");
-        extension_message(job->browser, ok ? "Extension added" : "Installation failed", msg);
+        extension_message(job->browser, ok ? "Extension added" : "Installation failed", ok ? msg + "\n\nReload open tabs so the extension can run on them." : msg);
     }), j, nullptr, GConnectFlags(0));
     // Whatever button is pressed, the dialog closes and the job (and temp file) is released when it is destroyed.
     g_signal_connect_swapped(add, "clicked", G_CALLBACK(gtk_window_destroy), win);
@@ -1313,6 +1319,144 @@ static gboolean on_decide_policy(WebKitWebView *view, WebKitPolicyDecision *deci
     return FALSE;
 }
 
+// ======================================================================= extension toolbar, popups, options, manager
+struct ExtBtnCtx { Browser *browser; std::string uuid; };
+
+static void ext_popover_show(GtkPopover *pop, gpointer d) {
+    auto *c = static_cast<ExtBtnCtx *>(d);
+    if (!c->browser->ext) return;
+    WebKitWebView *v = c->browser->ext->create_popup(c->uuid);
+    if (!v) return;
+    gtk_widget_set_size_request(GTK_WIDGET(v), 400, 560);
+    gtk_popover_set_child(pop, GTK_WIDGET(v));
+}
+static void ext_popover_closed(GtkPopover *pop, gpointer) { gtk_popover_set_child(pop, nullptr); }  // destroys the popup page
+
+static void refresh_extension_buttons(Browser *b) {
+    if (!b->ext_box || !b->ext) return;
+    auto actions = b->ext->actions();
+    std::string sig;
+    for (auto &a : actions) sig += a.uuid + "|" + a.icon_path + "|" + (a.popup.empty() ? "0" : "1") + ";";
+    const char *old = static_cast<const char *>(g_object_get_data(G_OBJECT(b->ext_box), "sig"));
+    if (!old || sig != old) {
+        while (GtkWidget *c = gtk_widget_get_first_child(b->ext_box)) gtk_box_remove(GTK_BOX(b->ext_box), c);
+        for (auto &a : actions) {
+            GtkWidget *btn;
+            GtkWidget *img = a.icon_path.empty() ? nullptr : gtk_image_new_from_file(a.icon_path.c_str());
+            if (img) gtk_image_set_pixel_size(GTK_IMAGE(img), 18);
+            if (!a.popup.empty()) {
+                btn = gtk_menu_button_new();
+                if (img) gtk_menu_button_set_child(GTK_MENU_BUTTON(btn), img); else gtk_menu_button_set_label(GTK_MENU_BUTTON(btn), a.name.substr(0, 1).c_str());
+                GtkWidget *pop = gtk_popover_new();
+                gtk_menu_button_set_popover(GTK_MENU_BUTTON(btn), pop);
+                g_signal_connect_data(pop, "show", G_CALLBACK(ext_popover_show), new ExtBtnCtx{b, a.uuid}, +[](gpointer p, GClosure *) { delete static_cast<ExtBtnCtx *>(p); }, GConnectFlags(0));
+                g_signal_connect(pop, "closed", G_CALLBACK(ext_popover_closed), nullptr);
+            } else {
+                btn = gtk_button_new();
+                if (img) gtk_button_set_child(GTK_BUTTON(btn), img); else gtk_button_set_label(GTK_BUTTON(btn), a.name.substr(0, 1).c_str());
+                g_signal_connect_data(btn, "clicked", G_CALLBACK(+[](GtkButton *, gpointer d) {
+                    auto *c = static_cast<ExtBtnCtx *>(d);
+                    Tab *t = active_tab(c->browser);
+                    if (t && c->browser->ext) c->browser->ext->action_clicked(c->uuid, t->id);
+                }), new ExtBtnCtx{b, a.uuid}, +[](gpointer p, GClosure *) { delete static_cast<ExtBtnCtx *>(p); }, GConnectFlags(0));
+            }
+            gtk_widget_add_css_class(btn, "flat");
+            GtkWidget *overlay = gtk_overlay_new();
+            gtk_overlay_set_child(GTK_OVERLAY(overlay), btn);
+            GtkWidget *badge = gtk_label_new("");
+            gtk_widget_add_css_class(badge, "ext-badge");
+            gtk_widget_set_halign(badge, GTK_ALIGN_END); gtk_widget_set_valign(badge, GTK_ALIGN_END);
+            gtk_widget_set_can_target(badge, FALSE); gtk_widget_set_visible(badge, FALSE);
+            gtk_overlay_add_overlay(GTK_OVERLAY(overlay), badge);
+            g_object_set_data_full(G_OBJECT(overlay), "uuid", g_strdup(a.uuid.c_str()), g_free);
+            g_object_set_data(G_OBJECT(overlay), "badge", badge);
+            g_object_set_data(G_OBJECT(overlay), "button", btn);
+            gtk_box_append(GTK_BOX(b->ext_box), overlay);
+        }
+        g_object_set_data_full(G_OBJECT(b->ext_box), "sig", g_strdup(sig.c_str()), g_free);
+    }
+    // cheap in-place update: titles and badges
+    for (GtkWidget *w = gtk_widget_get_first_child(b->ext_box); w; w = gtk_widget_get_next_sibling(w)) {
+        const char *uuid = static_cast<const char *>(g_object_get_data(G_OBJECT(w), "uuid"));
+        for (auto &a : actions) if (uuid && a.uuid == uuid) {
+            auto *badge = static_cast<GtkWidget *>(g_object_get_data(G_OBJECT(w), "badge"));
+            auto *btn = static_cast<GtkWidget *>(g_object_get_data(G_OBJECT(w), "button"));
+            gtk_widget_set_tooltip_text(btn, a.title.c_str());
+            gtk_label_set_text(GTK_LABEL(badge), a.badge.c_str());
+            gtk_widget_set_visible(badge, !a.badge.empty());
+            if (!a.badge_color.empty() && a.badge_color[0] == '#' && a.badge_color.size() <= 9) {
+                char *css = g_strdup_printf(".ext-badge{background:%s;color:white;border-radius:8px;padding:0 4px;font-size:9px;font-weight:700;}", a.badge_color.c_str());
+                GtkCssProvider *cp = gtk_css_provider_new();
+                gtk_css_provider_load_from_string(cp, css);
+                gtk_style_context_add_provider(gtk_widget_get_style_context(badge), GTK_STYLE_PROVIDER(cp), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+                g_object_unref(cp); g_free(css);
+            }
+        }
+    }
+    gtk_widget_set_visible(b->ext_box, !actions.empty());
+}
+
+static void open_extension_options(Browser *b, const std::string &uuid) {
+    if (!b->ext) return;
+    WebKitWebView *v = b->ext->create_options(uuid);
+    if (!v) { set_status(b, "This extension has no options page."); return; }
+    GtkWidget *win = gtk_window_new(); gtk_window_set_application(GTK_WINDOW(win), b->app);
+    gtk_window_set_title(GTK_WINDOW(win), "Extension options"); gtk_window_set_default_size(GTK_WINDOW(win), 820, 640);
+    gtk_window_set_child(GTK_WINDOW(win), GTK_WIDGET(v));
+    gtk_window_present(GTK_WINDOW(win));
+}
+
+struct ExtRowCtx { Browser *browser; std::string uuid; };
+static void show_extension_manager(Browser *b);
+static void ext_manager_populate(Browser *b, GtkWidget *list) {
+    while (GtkWidget *c = gtk_widget_get_first_child(list)) gtk_box_remove(GTK_BOX(list), c);
+    if (!b->ext) return;
+    auto items = b->ext->list();
+    if (items.empty()) {
+        GtkWidget *l = gtk_label_new("No extensions installed yet. Open addons.mozilla.org and use “Add to Firefox”, or “Install in ReedBrowser”.");
+        gtk_label_set_wrap(GTK_LABEL(l), TRUE); gtk_widget_set_halign(l, GTK_ALIGN_START); gtk_box_append(GTK_BOX(list), l); return;
+    }
+    for (auto &it : items) {
+        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        GtkWidget *label = gtk_label_new((it.name + "  " + it.version).c_str()); gtk_widget_set_hexpand(label, TRUE); gtk_widget_set_halign(label, GTK_ALIGN_START);
+        GtkWidget *sw = gtk_switch_new(); gtk_switch_set_active(GTK_SWITCH(sw), it.enabled); gtk_widget_set_valign(sw, GTK_ALIGN_CENTER); gtk_widget_set_tooltip_text(sw, "Enabled (content scripts change after restart)");
+        GtkWidget *opt = gtk_button_new_with_label("Options"); gtk_widget_set_sensitive(opt, it.has_options);
+        GtkWidget *rm = gtk_button_new_with_label("Remove");
+        g_signal_connect_data(sw, "state-set", G_CALLBACK(+[](GtkSwitch *, gboolean st, gpointer d) -> gboolean {
+            auto *c = static_cast<ExtRowCtx *>(d); c->browser->ext->set_enabled(c->uuid, st); return FALSE;
+        }), new ExtRowCtx{b, it.uuid}, +[](gpointer p, GClosure *) { delete static_cast<ExtRowCtx *>(p); }, GConnectFlags(0));
+        g_signal_connect_data(opt, "clicked", G_CALLBACK(+[](GtkButton *, gpointer d) { auto *c = static_cast<ExtRowCtx *>(d); open_extension_options(c->browser, c->uuid); }),
+            new ExtRowCtx{b, it.uuid}, +[](gpointer p, GClosure *) { delete static_cast<ExtRowCtx *>(p); }, GConnectFlags(0));
+        g_object_set_data(G_OBJECT(rm), "list", list);
+        g_signal_connect_data(rm, "clicked", G_CALLBACK(+[](GtkButton *bt, gpointer d) {
+            auto *c = static_cast<ExtRowCtx *>(d);
+            std::string msg; bool ok = c->browser->ext->remove(c->uuid, &msg);
+            set_status(c->browser, ok ? "Extension removed. Restart ReedBrowser to finish unloading it." : "Could not remove extension.");
+            ext_manager_populate(c->browser, GTK_WIDGET(g_object_get_data(G_OBJECT(bt), "list")));
+            refresh_extension_buttons(c->browser);
+        }), new ExtRowCtx{b, it.uuid}, +[](gpointer p, GClosure *) { delete static_cast<ExtRowCtx *>(p); }, GConnectFlags(0));
+        for (GtkWidget *w : {label, sw, opt, rm}) gtk_box_append(GTK_BOX(row), w);
+        gtk_box_append(GTK_BOX(list), row);
+    }
+}
+static void show_extension_manager(Browser *b) {
+    GtkWidget *win = gtk_window_new(); gtk_window_set_application(GTK_WINDOW(win), b->app);
+    gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(b->window));
+    gtk_window_set_title(GTK_WINDOW(win), "Extensions"); gtk_window_set_default_size(GTK_WINDOW(win), 560, 420);
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_set_margin_start(root, 16); gtk_widget_set_margin_end(root, 16); gtk_widget_set_margin_top(root, 16); gtk_widget_set_margin_bottom(root, 16);
+    GtkWidget *list = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    GtkWidget *scroll = gtk_scrolled_window_new(); gtk_widget_set_vexpand(scroll, TRUE); gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), list);
+    GtkWidget *hint = gtk_label_new("Find extensions at addons.mozilla.org. uBlock Origin Lite (MV3) and Proton Pass are the supported targets.");
+    gtk_label_set_wrap(GTK_LABEL(hint), TRUE); gtk_widget_set_halign(hint, GTK_ALIGN_START); gtk_widget_add_css_class(hint, "dim-label");
+    GtkWidget *browse = gtk_button_new_with_label("Browse Firefox Add-ons"); gtk_widget_set_halign(browse, GTK_ALIGN_START);
+    g_signal_connect_data(browse, "clicked", G_CALLBACK(+[](GtkButton *, gpointer d) { create_tab(static_cast<Browser *>(d), false, "https://addons.mozilla.org/", false); }), b, nullptr, GConnectFlags(0));
+    gtk_box_append(GTK_BOX(root), scroll); gtk_box_append(GTK_BOX(root), hint); gtk_box_append(GTK_BOX(root), browse);
+    gtk_window_set_child(GTK_WINDOW(win), root);
+    ext_manager_populate(b, list);
+    gtk_window_present(GTK_WINDOW(win));
+}
+
 static void on_menu_action(GtkButton *button, gpointer data) {
     Browser *b = static_cast<Browser *>(data); int action = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "action"));
     if (action == 0) create_tab(b, false, "", false);
@@ -1321,6 +1465,7 @@ static void on_menu_action(GtkButton *button, gpointer data) {
     else if (action == 3) set_theme(b, "dark");
     else if (action == 5) show_bookmark_manager(b);
     else if (action == 6) show_import_wizard(b);
+    else if (action == 7) show_extension_manager(b);
     else set_theme(b, "system");
     GtkWidget *p = gtk_widget_get_parent(GTK_WIDGET(button)); if (p) p = gtk_widget_get_parent(p); if (p && GTK_IS_POPOVER(p)) gtk_popover_popdown(GTK_POPOVER(p));
 }
@@ -1380,13 +1525,19 @@ static void activate(GtkApplication *app, gpointer data) {
     gtk_box_append(GTK_BOX(b->toolbar), b->address);
     gtk_box_append(GTK_BOX(b->toolbar), bookmark);
     gtk_box_append(GTK_BOX(b->toolbar), newtab);
+    b->ext_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+    gtk_box_append(GTK_BOX(b->toolbar), b->ext_box);
+    if (b->ext) {
+        b->ext->set_ui_callbacks([b]() { refresh_extension_buttons(b); }, [b](const std::string &uuid) { open_extension_options(b, uuid); });
+        refresh_extension_buttons(b);
+    }
     GtkWidget *menu_button = gtk_menu_button_new();
     gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(menu_button), "open-menu-symbolic");
     gtk_widget_set_tooltip_text(menu_button, "ReedBrowser menu");
     GtkWidget *popover = gtk_popover_new(); GtkWidget *menu_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
     gtk_widget_set_margin_start(menu_box, 8); gtk_widget_set_margin_end(menu_box, 8); gtk_widget_set_margin_top(menu_box, 8); gtk_widget_set_margin_bottom(menu_box, 8);
-    const char *menu_labels[] = {"New tab", "New private tab", "Settings & extensions", "Dark mode", "System theme", "Bookmarks (Ctrl+Shift+O)", "Import bookmarks…"};
-    for (int i=0;i<7;i++) { GtkWidget *item=gtk_button_new_with_label(menu_labels[i]); gtk_widget_add_css_class(item,"flat"); g_object_set_data(G_OBJECT(item),"action",GINT_TO_POINTER(i)); g_signal_connect(item,"clicked",G_CALLBACK(on_menu_action),b); gtk_box_append(GTK_BOX(menu_box),item); }
+    const char *menu_labels[] = {"New tab", "New private tab", "Settings & extensions", "Dark mode", "System theme", "Bookmarks (Ctrl+Shift+O)", "Import bookmarks…", "Extensions"};
+    for (int i=0;i<8;i++) { GtkWidget *item=gtk_button_new_with_label(menu_labels[i]); gtk_widget_add_css_class(item,"flat"); g_object_set_data(G_OBJECT(item),"action",GINT_TO_POINTER(i)); g_signal_connect(item,"clicked",G_CALLBACK(on_menu_action),b); gtk_box_append(GTK_BOX(menu_box),item); }
     gtk_popover_set_child(GTK_POPOVER(popover),menu_box); gtk_menu_button_set_popover(GTK_MENU_BUTTON(menu_button),popover); gtk_box_append(GTK_BOX(b->toolbar),menu_button);
     g_signal_connect(b->address, "activate", G_CALLBACK(on_address_activate), b);
 

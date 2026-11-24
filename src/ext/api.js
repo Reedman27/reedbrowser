@@ -96,6 +96,51 @@ function sendResult(r) {
     return r && r.responded ? r.value : undefined;
 }
 
+// ---- ports (runtime.connect / tabs.connect) -------------------------------------
+const portTable = new Map();
+class Port {
+    constructor(id, name, sender) {
+        this._id = id; this.name = name; this.sender = sender; this.error = null; this._open = true;
+        this.onMessage = new Ev(); this.onDisconnect = new Ev();
+    }
+    postMessage(data) {
+        if (!this._open) throw new Error("Attempt to postMessage on disconnected port");
+        post("port.post", { id: this._id, data: data === undefined ? null : data }).catch(() => {});
+    }
+    disconnect() {
+        if (!this._open) return;
+        this._open = false; portTable.delete(this._id);
+        post("port.disconnect", { id: this._id }).catch(() => {});
+    }
+    _closed(err) {
+        if (!this._open) return;
+        this._open = false; portTable.delete(this._id);
+        if (err) { this.error = { message: err }; runtime.lastError = this.error; }
+        try { this.onDisconnect._fire(this); } finally { runtime.lastError = undefined; }
+    }
+}
+function makePort(info, tabId) {
+    const id = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now());
+    const port = new Port(id, (info && info.name) || "", undefined);
+    portTable.set(id, port);
+    const args = { id, name: port.name };
+    if (tabId !== null && tabId !== undefined) args.tabId = tabId;
+    post("port.connect", args).catch((e) => setTimeout(() => port._closed(String(e.message || e)), 0));
+    return port;
+}
+Object.defineProperty(self, "__reedPortConnect", {
+    value: (m) => {
+        const port = new Port(m.id, m.name, m.sender);
+        portTable.set(m.id, port);
+        const e = events["runtime.onConnect"];
+        if (!e || !e.hasListeners()) { port.disconnect(); return null; }
+        e._fire(port);
+        return null;
+    },
+});
+Object.defineProperty(self, "__reedPortMsg", { value: (m) => { const p = portTable.get(m.id); if (p) p.onMessage._fire(m.data, p); return null; } });
+Object.defineProperty(self, "__reedPortDisc", { value: (id) => { const p = portTable.get(id); if (p) p._closed(); return null; } });
+
 // ---- runtime ---------------------------------------------------------------
 const runtime = wrapAll({
     id: __cfg.id,
@@ -106,17 +151,16 @@ const runtime = wrapAll({
         const message = (typeof a === "string" && b !== undefined && !isBg) ? b : (typeof a === "string" && b !== undefined ? b : a);
         return post("runtime.sendMessage", { message }).then(sendResult);
     },
-    connect: (info) => {
-        report("runtime.connect (stub: ports never deliver messages)");
-        return { name: (info && info.name) || "", sender: undefined, postMessage() {}, disconnect() {},
-                 onMessage: new Ev(), onDisconnect: new Ev() };
-    },
+    connect: (a, b) => makePort((typeof a === "object" && a !== null ? a : b) || {}, null),
     getPlatformInfo: () => ({ os: "linux", arch: "x86-64" }),
     getBrowserInfo: () => ({ name: "ReedBrowser", vendor: "ReedBrowser", version: __cfg.version, buildID: "0" }),
     openOptionsPage: () => post("runtime.openOptionsPage"),
+    connectNative: () => { report("runtime.connectNative"); throw new Error("Native messaging is not supported by ReedBrowser yet"); },
+    sendNativeMessage: () => { report("runtime.sendNativeMessage"); return Promise.reject(new Error("Native messaging is not supported by ReedBrowser yet")); },
     setUninstallURL: () => undefined,
     reload: () => { report("runtime.reload"); },
 });
+runtime.connect = (a, b) => makePort((typeof a === "object" && a !== null ? a : b) || {}, null);  // synchronous: not promise-wrapped
 runtime.onMessage = ev("runtime.onMessage");
 runtime.onConnect = ev("runtime.onConnect");
 runtime.onInstalled = ev("runtime.onInstalled");
@@ -155,11 +199,23 @@ const tabs = wrapAll({
     remove: (ids) => post("tabs.remove", { ids: Array.isArray(ids) ? ids : [ids] }),
     reload: (id) => post("tabs.reload", { id: typeof id === "number" ? id : null }),
     sendMessage: (id, message) => post("tabs.sendMessage", { id, message }).then(sendResult),
-    executeScript: () => { report("tabs.executeScript"); throw new Error("tabs.executeScript is not supported by ReedBrowser yet"); },
-    insertCSS: () => { report("tabs.insertCSS"); throw new Error("tabs.insertCSS is not supported by ReedBrowser yet"); },
+    connect: (id, info) => makePort(info || {}, id),
+    executeScript: (a, b) => {
+        const tabId = typeof a === "number" ? a : null, d = (typeof a === "number" ? b : a) || {};
+        return post("tabs.executeScript", { tabId, code: d.code, file: d.file, world: d.world });
+    },
+    insertCSS: (a, b) => {
+        const tabId = typeof a === "number" ? a : null, d = (typeof a === "number" ? b : a) || {};
+        return post("tabs.insertCSS", { tabId, css: d.code, file: d.file });
+    },
+    removeCSS: (a, b) => {
+        const tabId = typeof a === "number" ? a : null, d = (typeof a === "number" ? b : a) || {};
+        return post("tabs.removeCSS", { tabId, css: d.code, file: d.file });
+    },
     move: () => undefined,
     TAB_ID_NONE: -1,
 });
+tabs.connect = (id, info) => makePort(info || {}, id);  // synchronous: not promise-wrapped
 for (const n of ["onCreated", "onUpdated", "onRemoved", "onActivated", "onReplaced", "onMoved", "onAttached", "onDetached"])
     tabs[n] = n === "onReplaced" || n === "onMoved" || n === "onAttached" || n === "onDetached" ? inertEv("tabs." + n) : ev("tabs." + n);
 
@@ -255,10 +311,48 @@ const management = wrapAll({
     getSelf: () => ({ id: __cfg.id, name: manifest.name, version: manifest.version, enabled: true, type: "extension", installType: "normal" }),
 });
 
+// ---- scripting (MV3) and contentScripts (MV2) ---------------------------------
+const scripting = wrapAll({
+    executeScript: (inj) => {
+        const t = (inj && inj.target) || {};
+        const args = { tabId: t.tabId === undefined ? null : t.tabId, files: inj.files || [], world: inj.world };
+        if (typeof inj.func === "function") { args.func = inj.func.toString(); args.args = inj.args || []; }
+        return post("scripting.executeScript", args);
+    },
+    insertCSS: (inj) => { const t = inj.target || {}; return post("scripting.insertCSS", { tabId: t.tabId === undefined ? null : t.tabId, css: inj.css, files: inj.files || [] }); },
+    removeCSS: (inj) => { const t = inj.target || {}; return post("scripting.removeCSS", { tabId: t.tabId === undefined ? null : t.tabId, css: inj.css, files: inj.files || [] }); },
+    registerContentScripts: (list) => post("scripting.registerContentScripts", { scripts: list }),
+    unregisterContentScripts: (f) => post("scripting.unregisterContentScripts", { ids: (f && f.ids) || [] }),
+    updateContentScripts: (list) => post("scripting.updateContentScripts", { scripts: list }),
+    getRegisteredContentScripts: (f) => post("scripting.getRegisteredContentScripts", { ids: (f && f.ids) || [] }),
+});
+const contentScripts = wrapAll({
+    register: (opts) => {
+        const o = Object.assign({}, opts);
+        const split = (arr) => { const files = [], code = []; for (const x of arr || []) { if (typeof x === "string") files.push(x); else if (x.file) files.push(x.file); else if (x.code) code.push(x.code); } return [files, code]; };
+        const [jf, jc] = split(opts.js), [cf, cc] = split(opts.css);
+        o.js = jf; o.jsCode = jc; o.css = cf; o.cssCode = cc;
+        return post("contentScripts.register", { opts: o }).then((id) => ({ unregister: () => post("scripting.unregisterContentScripts", { ids: [id] }) }));
+    },
+});
+
+const dnrCall = (op) => (a) => post("dnr." + op, a || {});
+const declarativeNetRequest = wrapAll({
+    updateDynamicRules: dnrCall("updateDynamicRules"), updateSessionRules: dnrCall("updateSessionRules"),
+    getDynamicRules: dnrCall("getDynamicRules"), getSessionRules: dnrCall("getSessionRules"),
+    getEnabledRulesets: dnrCall("getEnabledRulesets"), updateEnabledRulesets: dnrCall("updateEnabledRulesets"),
+    getAvailableStaticRuleCount: dnrCall("getAvailableStaticRuleCount"), getDisabledRuleIds: dnrCall("getDisabledRuleIds"),
+    updateStaticRules: dnrCall("noop"), setExtensionActionOptions: dnrCall("noop"),
+    isRegexSupported: (o) => post("dnr.isRegexSupported", { regex: (o && o.regex) || "" }),
+    getMatchedRules: dnrCall("getMatchedRules"),
+    MAX_NUMBER_OF_STATIC_RULESETS: 100, MAX_NUMBER_OF_ENABLED_STATIC_RULESETS: 50,
+    MAX_NUMBER_OF_DYNAMIC_RULES: 30000, MAX_NUMBER_OF_UNSAFE_DYNAMIC_RULES: 5000, GUARANTEED_MINIMUM_STATIC_RULES: 30000,
+});
+
 // ---- assemble -----------------------------------------------------------------
 const real = {
     runtime, storage, tabs, windows, alarms, i18n, permissions, webRequest, webNavigation, menus, contextMenus: menus,
-    commands, privacy, management,
+    commands, privacy, management, scripting, contentScripts, declarativeNetRequest,
     extension: { getURL: runtime.getURL, inIncognitoContext: false, getBackgroundPage: () => (isBg ? window : null) },
     browserAction: actionApi(), action: actionApi(), pageAction: actionApi(),
     dns: wrapAll({ resolve: () => { report("dns.resolve"); throw new Error("dns.resolve is not supported by ReedBrowser"); } }),
