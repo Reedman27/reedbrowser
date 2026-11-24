@@ -13,6 +13,11 @@ struct Row {
     std::string title, uri;
 };
 
+struct Bookmark {
+    long long id = 0;
+    std::string title, uri, folder;
+};
+
 struct DownloadRow {
     std::string name, path, state;
 };
@@ -31,6 +36,8 @@ public:
         exec("CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY, title TEXT NOT NULL, uri TEXT NOT NULL, visited INTEGER NOT NULL);");
         exec("CREATE INDEX IF NOT EXISTS history_visited ON history(visited DESC);");
         exec("CREATE TABLE IF NOT EXISTS bookmarks(id INTEGER PRIMARY KEY, title TEXT NOT NULL, uri TEXT NOT NULL UNIQUE, created INTEGER NOT NULL);");
+        exec("ALTER TABLE bookmarks ADD COLUMN folder TEXT NOT NULL DEFAULT '';");  // fails harmlessly if present
+        exec("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);");
         exec("CREATE TABLE IF NOT EXISTS zoom(host TEXT PRIMARY KEY, level REAL NOT NULL);");
         exec("CREATE TABLE IF NOT EXISTS session(pos INTEGER PRIMARY KEY, uri TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 0);");
         exec("CREATE TABLE IF NOT EXISTS downloads(id INTEGER PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL, state TEXT NOT NULL, finished INTEGER NOT NULL);");
@@ -105,6 +112,63 @@ public:
         while (sqlite3_step(st) == SQLITE_ROW) out.push_back({sqlite3_column_int64(st, 0), text(st, 1), text(st, 2)});
         sqlite3_finalize(st);
         return out;
+    }
+
+    std::vector<Bookmark> bookmarks_full(const std::string &filter = "") {
+        std::vector<Bookmark> out;
+        sqlite3_stmt *st = prep("SELECT id,title,uri,folder FROM bookmarks WHERE title LIKE ?1 ESCAPE '\\' OR uri LIKE ?1 ESCAPE '\\' OR folder LIKE ?1 ESCAPE '\\' ORDER BY folder COLLATE NOCASE, title COLLATE NOCASE");
+        if (!st) return out;
+        bind(st, 1, like(filter));
+        while (sqlite3_step(st) == SQLITE_ROW) out.push_back({sqlite3_column_int64(st, 0), text(st, 1), text(st, 2), text(st, 3)});
+        sqlite3_finalize(st);
+        return out;
+    }
+    bool get_bookmark(long long id, Bookmark *out) {
+        sqlite3_stmt *st = prep("SELECT id,title,uri,folder FROM bookmarks WHERE id=?");
+        bool ok = false;
+        if (st) { sqlite3_bind_int64(st, 1, id); if (sqlite3_step(st) == SQLITE_ROW) { *out = {sqlite3_column_int64(st, 0), text(st, 1), text(st, 2), text(st, 3)}; ok = true; } }
+        sqlite3_finalize(st);
+        return ok;
+    }
+    // Returns false if the URL is already used by a different bookmark.
+    bool update_bookmark(long long id, const std::string &title, const std::string &uri, const std::string &folder) {
+        sqlite3_stmt *st = prep("UPDATE bookmarks SET title=?, uri=?, folder=? WHERE id=?");
+        bool ok = false;
+        if (st) { bind(st, 1, title.empty() ? uri : title); bind(st, 2, uri); bind(st, 3, folder); sqlite3_bind_int64(st, 4, id); ok = sqlite3_step(st) == SQLITE_DONE; }
+        sqlite3_finalize(st);
+        return ok;
+    }
+    // Bulk import in one transaction. Existing URLs are kept. Returns number of new bookmarks.
+    int import_bookmarks(const std::vector<Bookmark> &items) {
+        int before = count_bookmarks();
+        exec("BEGIN;");
+        for (const auto &it : items) {
+            sqlite3_stmt *st = prep("INSERT OR IGNORE INTO bookmarks(title,uri,folder,created) VALUES(?,?,?,strftime('%s','now'))");
+            if (!st) continue;
+            bind(st, 1, it.title.empty() ? it.uri : it.title); bind(st, 2, it.uri); bind(st, 3, it.folder);
+            sqlite3_step(st); sqlite3_finalize(st);
+        }
+        exec("COMMIT;");
+        return count_bookmarks() - before;
+    }
+    int count_bookmarks() {
+        sqlite3_stmt *st = prep("SELECT COUNT(*) FROM bookmarks");
+        int n = 0;
+        if (st && sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+        return n;
+    }
+    std::string meta(const std::string &k) {
+        sqlite3_stmt *st = prep("SELECT v FROM meta WHERE k=?");
+        std::string v;
+        if (st) { bind(st, 1, k); if (sqlite3_step(st) == SQLITE_ROW) v = text(st, 0); }
+        sqlite3_finalize(st);
+        return v;
+    }
+    void set_meta(const std::string &k, const std::string &v) {
+        sqlite3_stmt *st = prep("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)");
+        if (st) { bind(st, 1, k); bind(st, 2, v); sqlite3_step(st); }
+        sqlite3_finalize(st);
     }
 
     // ---- zoom

@@ -361,6 +361,38 @@ static bool is_https_url(const std::string &url) {
     return url.rfind("https://", 0) == 0;
 }
 
+static bool download_https_file(const std::string &url, const std::string &destination, std::string *err) {
+    if (!is_https_url(url)) { *err = "Only HTTPS downloads are allowed."; return false; }
+    static const CURLcode curl_init_status = curl_global_init(CURL_GLOBAL_DEFAULT);
+    if (curl_init_status != CURLE_OK) { *err = "Could not initialize HTTPS support."; return false; }
+    FILE *out = std::fopen(destination.c_str(), "wb");
+    if (!out) { *err = "Could not create temporary XPI file."; return false; }
+    CURL *curl = curl_easy_init();
+    if (!curl) { std::fclose(out); *err = "Could not initialize XPI downloader."; return false; }
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ReedBrowser/0.5.2 (Firefox Add-ons installer)");
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_to_file);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, out);
+    CURLcode rc = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_cleanup(curl);
+    bool file_ok = std::fclose(out) == 0;
+    if (rc != CURLE_OK || status < 200 || status >= 300 || !file_ok || fs::file_size(destination) < 128) {
+        std::error_code ec; fs::remove(destination, ec);
+        *err = "XPI download failed (" + std::string(curl_easy_strerror(rc)) + ", HTTP " + std::to_string(status) + ").";
+        return false;
+    }
+    return true;
+}
+
 static bool download_amo_xpi(const std::string &input, const std::string &destination, std::string *err) {
     // Accept an AMO add-on page or a direct AMO API add-on slug. Do not accept
     // arbitrary remote URLs here: the API response is constrained to HTTPS.
@@ -440,31 +472,7 @@ static bool download_amo_xpi(const std::string &input, const std::string &destin
         return false;
     }
 
-    FILE *out = std::fopen(destination.c_str(), "wb");
-    if (!out) { *err = "Could not create temporary XPI file."; return false; }
-    curl = curl_easy_init();
-    if (!curl) { std::fclose(out); *err = "Could not initialize XPI downloader."; return false; }
-    curl_easy_setopt(curl, CURLOPT_URL, xpi_url.c_str());
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
-    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ReedBrowser/0.5.2 (Firefox Add-ons installer)");
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_to_file);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, out);
-    rc = curl_easy_perform(curl);
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-    curl_easy_cleanup(curl);
-    bool file_ok = std::fclose(out) == 0;
-    if (rc != CURLE_OK || status < 200 || status >= 300 || !file_ok || fs::file_size(destination) < 128) {
-        std::error_code ec; fs::remove(destination, ec);
-        *err = "XPI download failed (" + std::string(curl_easy_strerror(rc)) + ", HTTP " + std::to_string(status) + ").";
-        return false;
-    }
-    return true;
+    return download_https_file(xpi_url, destination, err);
 }
 
 static bool extract_archive(const std::string &file, const std::string &dest, std::string *err) {
@@ -491,6 +499,11 @@ static bool extract_archive(const std::string &file, const std::string &dest, st
     }
     archive_read_free(a);
     return ok;
+}
+
+bool ExtensionManager::fetch_package(const std::string &source, const std::string &destination, std::string *err) {
+    if (source.rfind("https://", 0) == 0 && source.find("/addon/") == std::string::npos) return download_https_file(source, destination, err);
+    return download_amo_xpi(source, destination, err);
 }
 
 bool ExtensionManager::install(const std::string &path, bool assume_yes, std::string *message) {

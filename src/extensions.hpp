@@ -38,6 +38,8 @@ public:
 
     // CLI-side management (no display needed).
     bool install(const std::string &path, bool assume_yes, std::string *message);
+    // Thread-safe: download an AMO page/amo:slug or a direct https XPI to `destination`.
+    static bool fetch_package(const std::string &source, const std::string &destination, std::string *err);
     bool remove(const std::string &id_or_name, std::string *message);
     std::string describe() const;  // human-readable list
 

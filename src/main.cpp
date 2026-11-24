@@ -21,6 +21,7 @@
 
 #include "store.hpp"
 #include "extensions.hpp"
+#include "importer.hpp"
 
 #ifndef REEDBROWSER_VERSION
 #define REEDBROWSER_VERSION "0.5.0"
@@ -72,7 +73,18 @@ struct Browser {
     std::string cache_dir;
     std::string download_dir;
     bool shutting_down{false};
+    GtkWidget *manager_win{};   // bookmark manager window, if open
+    std::string home_token;     // per-session secret so web pages cannot forge reed:// actions
 };
+
+// Forward declarations for features defined after the settings UI.
+static void bookmarks_changed(Browser *b);
+static void show_bookmark_manager(Browser *b);
+static void show_bookmark_editor(Browser *b, long long id);
+static void show_import_wizard(Browser *b);
+static void start_extension_install(Browser *b, WebKitWebView *origin, const std::string &source, int install_id);
+static void attach_amo_support(Browser *b, WebKitWebView *view, WebKitUserContentManager *ucm);
+static gboolean on_decide_policy(WebKitWebView *view, WebKitPolicyDecision *decision, WebKitPolicyDecisionType type, gpointer data);
 
 static std::string home_path(const char *leaf) {
     const char *home = g_get_home_dir();
@@ -158,12 +170,33 @@ static std::string homepage_html(Browser *b, bool private_mode) {
     html += "<style>:root{--reed-accent:" + b->accent + ";} .brand{color:var(--reed-accent)}.search:focus-within{border-color:var(--reed-accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--reed-accent) 22%,transparent)}.link:hover{border-color:var(--reed-accent)!important}</style>";
     if (b->theme == "dark") html += "<style>:root{color-scheme:dark}body{background:#17191e!important;color:#e7e9ed!important}.search,.link{background:#22252c!important;border-color:#343943!important;color:#e7e9ed!important}.sub,.heading,.muted{color:#9ba3b0!important}</style>";
     else if (b->theme == "light") html += "<style>:root{color-scheme:light}body{background:#f5f6f8!important;color:#20242b!important}.search,.link{background:white!important;color:#20242b!important}</style>";
-    auto bookmarks = b->store.bookmarks();
-    html += "<section class=\"section\"><div class=\"heading\">BOOKMARKS</div><div class=\"links\">";
-    if (bookmarks.empty()) html += "<span class=\"muted\">Your saved sites will appear here.</span>";
-    for (const auto &row : bookmarks)
-        html += "<a class=\"link\" href=\"" + html_escape(row.uri) + "\">" + html_escape(row.title.empty() ? row.uri : row.title) + "</a>";
-    html += "</div></section>";
+    {
+        const std::string t = "?t=" + b->home_token;
+        html += "<style>.tile{display:inline-flex;align-items:center;gap:2px;margin:0 8px 8px 0}.tile .link{margin:0}"
+                ".tile .act{font-size:12px;text-decoration:none;color:inherit;opacity:.35;padding:4px 5px;border-radius:6px}"
+                ".tile:hover .act{opacity:.9}.tile .act:hover{background:rgba(127,127,127,.25)}.tile .rm:hover{color:#e5484d}"
+                ".folder{margin:14px 0 8px;font-size:12px;opacity:.7}.hl{font-size:12px;margin-left:12px;text-decoration:none;color:var(--reed-accent)}</style>";
+        html += "<section class=\"section\"><div class=\"heading\">BOOKMARKS<a class=\"hl\" href=\"reed://manage" + t + "\">Manage</a>"
+                "<a class=\"hl\" href=\"reed://import" + t + "\">Import</a></div>";
+        auto bookmarks = b->store.bookmarks_full();
+        if (bookmarks.empty()) html += "<div class=\"links\"><span class=\"muted\">Your saved sites will appear here. Press Ctrl+D on a page to save it, or use Import.</span></div>";
+        std::string current = "\x01";
+        bool open = false;
+        for (const auto &row : bookmarks) {
+            if (row.folder != current) {
+                if (open) html += "</div>";
+                current = row.folder;
+                if (!current.empty()) html += "<div class=\"folder\">&#128193; " + html_escape(current) + "</div>";
+                html += "<div class=\"links\">"; open = true;
+            }
+            std::string id = std::to_string(row.id);
+            html += "<span class=\"tile\"><a class=\"link\" href=\"" + html_escape(row.uri) + "\">" + html_escape(row.title.empty() ? row.uri : row.title) + "</a>"
+                    "<a class=\"act\" title=\"Edit bookmark\" href=\"reed://edit/" + id + t + "\">&#9998;</a>"
+                    "<a class=\"act rm\" title=\"Remove bookmark\" href=\"reed://remove/" + id + t + "\">&#10005;</a></span>";
+        }
+        if (open) html += "</div>";
+        html += "</section>";
+    }
     if (!private_mode) {
         html += "<section class=\"section\"><div class=\"heading\">RECENT</div><div class=\"links\">";
         auto recent = b->store.recent_unique(8);
@@ -491,6 +524,7 @@ static WebKitWebView *create_tab(Browser *b, bool private_mode, const std::strin
         nullptr));
     g_object_unref(settings);
     if (b->ext) b->ext->attach_view(tab->view, tab->content_manager, tab->id, private_mode);
+    if (!private_mode) attach_amo_support(b, tab->view, tab->content_manager);
     g_object_unref(tab->content_manager);
     gtk_widget_set_hexpand(GTK_WIDGET(tab->view), TRUE);
     gtk_widget_set_vexpand(GTK_WIDGET(tab->view), TRUE);
@@ -503,6 +537,7 @@ static WebKitWebView *create_tab(Browser *b, bool private_mode, const std::strin
     g_signal_connect(tab->view, "permission-request", G_CALLBACK(on_permission), b);
     g_signal_connect(tab->view, "web-process-terminated", G_CALLBACK(on_process_terminated), tab);
     g_signal_connect(tab->view, "create", G_CALLBACK(on_create_view), tab);
+    g_signal_connect(tab->view, "decide-policy", G_CALLBACK(on_decide_policy), tab);
 
     GtkWidget *label = make_tab_label(tab);
     int page = gtk_notebook_append_page(GTK_NOTEBOOK(b->notebook), GTK_WIDGET(tab->view), label);
@@ -634,6 +669,7 @@ static gboolean on_key_pressed(GtkEventControllerKey *, guint keyval, guint, Gdk
     if (ctrl && shift && (keyval == GDK_KEY_n || keyval == GDK_KEY_N)) { create_tab(b, true, "", false); set_status(b, "Private tab: history and site data are not saved."); return TRUE; }
     if (ctrl && (keyval == GDK_KEY_r || keyval == GDK_KEY_R)) { if (tab) webkit_web_view_reload(tab->view); return TRUE; }
     if (ctrl && (keyval == GDK_KEY_d || keyval == GDK_KEY_D)) { toggle_bookmark(b); return TRUE; }
+    if (ctrl && shift && (keyval == GDK_KEY_o || keyval == GDK_KEY_O)) { show_bookmark_manager(b); return TRUE; }
     if (ctrl && (keyval == GDK_KEY_f || keyval == GDK_KEY_F)) { show_find(b); return TRUE; }
     if (ctrl && shift && (keyval == GDK_KEY_Tab || keyval == GDK_KEY_Page_Up)) {
         int n = gtk_notebook_get_n_pages(GTK_NOTEBOOK(b->notebook)); if (n > 1) gtk_notebook_prev_page(GTK_NOTEBOOK(b->notebook)); return TRUE;
@@ -820,12 +856,471 @@ static void show_settings(Browser *b) {
     g_signal_connect(search,"search-changed",G_CALLBACK(+[](GtkSearchEntry *entry,gpointer d){GtkNotebook *nb=GTK_NOTEBOOK(d);const char*q=gtk_editable_get_text(GTK_EDITABLE(entry));std::string query=q?q:"";std::transform(query.begin(),query.end(),query.begin(),[](unsigned char c){return std::tolower(c);});if(query.empty())return;for(int i=0;i<gtk_notebook_get_n_pages(nb);++i){GtkWidget *tab=gtk_notebook_get_tab_label(nb,gtk_notebook_get_nth_page(nb,i));const char*t=GTK_IS_LABEL(tab)?gtk_label_get_text(GTK_LABEL(tab)):"";std::string name=t?t:"";std::transform(name.begin(),name.end(),name.begin(),[](unsigned char c){return std::tolower(c);});if(name.find(query)!=std::string::npos){gtk_notebook_set_current_page(nb,i);break;}}}),pages);
     gtk_window_set_child(GTK_WINDOW(win),root); gtk_window_present(GTK_WINDOW(win));
 }
+// ======================================================================= bookmarks UI
+static void refresh_home_tabs(Browser *b) {
+    for (auto &tab : b->tabs) {
+        const char *uri = webkit_web_view_get_uri(tab->view);
+        if (!uri || g_strcmp0(uri, "about:blank") == 0) load_home(tab.get());
+    }
+}
+
+struct ManagerCtx { Browser *browser; GtkWidget *list; GtkWidget *search; GtkWidget *count; };
+struct RowCtx { Browser *browser; long long id; };
+struct EditCtx { Browser *browser; long long id; GtkWidget *win, *title, *uri, *folder, *error; };
+
+static void manager_populate(Browser *b) {
+    if (!b->manager_win) return;
+    auto *ctx = static_cast<ManagerCtx *>(g_object_get_data(G_OBJECT(b->manager_win), "ctx"));
+    if (!ctx) return;
+    while (GtkWidget *c = gtk_widget_get_first_child(ctx->list)) gtk_list_box_remove(GTK_LIST_BOX(ctx->list), c);
+    const char *q = gtk_editable_get_text(GTK_EDITABLE(ctx->search));
+    auto rows = b->store.bookmarks_full(q ? q : "");
+    std::string current = "\x01";
+    for (const auto &r : rows) {
+        if (r.folder != current) {
+            current = r.folder;
+            GtkWidget *h = gtk_label_new((current.empty() ? "Bookmarks" : current).c_str());
+            gtk_widget_add_css_class(h, "heading"); gtk_widget_set_halign(h, GTK_ALIGN_START);
+            gtk_widget_set_margin_top(h, 10); gtk_widget_set_margin_start(h, 6);
+            GtkWidget *hr = gtk_list_box_row_new(); gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(hr), h);
+            gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(hr), FALSE); gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(hr), FALSE);
+            gtk_list_box_append(GTK_LIST_BOX(ctx->list), hr);
+        }
+        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        gtk_widget_set_margin_start(row, 8); gtk_widget_set_margin_end(row, 8); gtk_widget_set_margin_top(row, 4); gtk_widget_set_margin_bottom(row, 4);
+        GtkWidget *col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 1); gtk_widget_set_hexpand(col, TRUE);
+        GtkWidget *t = gtk_label_new((r.title.empty() ? r.uri : r.title).c_str()); gtk_widget_set_halign(t, GTK_ALIGN_START); gtk_label_set_ellipsize(GTK_LABEL(t), PANGO_ELLIPSIZE_END); gtk_label_set_xalign(GTK_LABEL(t), 0);
+        GtkWidget *u = gtk_label_new(r.uri.c_str()); gtk_widget_set_halign(u, GTK_ALIGN_START); gtk_widget_add_css_class(u, "dim-label"); gtk_label_set_ellipsize(GTK_LABEL(u), PANGO_ELLIPSIZE_END); gtk_label_set_xalign(GTK_LABEL(u), 0);
+        gtk_box_append(GTK_BOX(col), t); gtk_box_append(GTK_BOX(col), u);
+        GtkWidget *open = gtk_button_new_from_icon_name("go-next-symbolic"); gtk_widget_set_tooltip_text(open, "Open");
+        GtkWidget *edit = gtk_button_new_with_label("Edit"); gtk_widget_set_tooltip_text(edit, "Edit");
+        GtkWidget *del = gtk_button_new_from_icon_name("user-trash-symbolic"); gtk_widget_set_tooltip_text(del, "Remove");
+        for (GtkWidget *w : {open, edit, del}) { gtk_widget_add_css_class(w, "flat"); gtk_widget_set_valign(w, GTK_ALIGN_CENTER); }
+        g_object_set_data_full(G_OBJECT(open), "uri", g_strdup(r.uri.c_str()), g_free);
+        g_object_set_data(G_OBJECT(open), "browser", b);
+        g_signal_connect(open, "clicked", G_CALLBACK(+[](GtkButton *bt, gpointer) {
+            auto *br = static_cast<Browser *>(g_object_get_data(G_OBJECT(bt), "browser"));
+            create_tab(br, false, static_cast<const char *>(g_object_get_data(G_OBJECT(bt), "uri")), false);
+        }), nullptr);
+        g_signal_connect_data(edit, "clicked", G_CALLBACK(+[](GtkButton *, gpointer d) {
+            auto *rc = static_cast<RowCtx *>(d); show_bookmark_editor(rc->browser, rc->id);
+        }), new RowCtx{b, r.id}, +[](gpointer p, GClosure *) { delete static_cast<RowCtx *>(p); }, GConnectFlags(0));
+        g_signal_connect_data(del, "clicked", G_CALLBACK(+[](GtkButton *, gpointer d) {
+            auto *rc = static_cast<RowCtx *>(d); rc->browser->store.delete_bookmark(rc->id);
+            set_status(rc->browser, "Bookmark removed."); bookmarks_changed(rc->browser);
+        }), new RowCtx{b, r.id}, +[](gpointer p, GClosure *) { delete static_cast<RowCtx *>(p); }, GConnectFlags(0));
+        gtk_box_append(GTK_BOX(row), col); gtk_box_append(GTK_BOX(row), open); gtk_box_append(GTK_BOX(row), edit); gtk_box_append(GTK_BOX(row), del);
+        gtk_list_box_append(GTK_LIST_BOX(ctx->list), row);
+    }
+    int total = b->store.count_bookmarks();
+    std::string msg = rows.empty() ? (total ? "No bookmarks match your search." : "No bookmarks yet. Press Ctrl+D on a page, or import them.")
+                                   : std::to_string(rows.size()) + " of " + std::to_string(total) + " bookmarks";
+    gtk_label_set_text(GTK_LABEL(ctx->count), msg.c_str());
+}
+
+static void bookmarks_changed(Browser *b) { refresh_home_tabs(b); manager_populate(b); }
+
+static void show_bookmark_manager(Browser *b) {
+    if (b->manager_win) { gtk_window_present(GTK_WINDOW(b->manager_win)); manager_populate(b); return; }
+    GtkWidget *win = gtk_window_new(); gtk_window_set_application(GTK_WINDOW(win), b->app);
+    gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(b->window));
+    gtk_window_set_title(GTK_WINDOW(win), "Bookmarks"); gtk_window_set_default_size(GTK_WINDOW(win), 640, 560);
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_start(root, 12); gtk_widget_set_margin_end(root, 12); gtk_widget_set_margin_top(root, 12); gtk_widget_set_margin_bottom(root, 12);
+    GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *search = gtk_search_entry_new(); gtk_widget_set_hexpand(search, TRUE); gtk_search_entry_set_placeholder_text(GTK_SEARCH_ENTRY(search), "Search title, address or folder");
+    GtkWidget *imp = gtk_button_new_with_label("Import…");
+    gtk_box_append(GTK_BOX(top), search); gtk_box_append(GTK_BOX(top), imp); gtk_box_append(GTK_BOX(root), top);
+    GtkWidget *list = gtk_list_box_new(); gtk_list_box_set_selection_mode(GTK_LIST_BOX(list), GTK_SELECTION_NONE);
+    GtkWidget *scroll = gtk_scrolled_window_new(); gtk_widget_set_vexpand(scroll, TRUE); gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), list);
+    gtk_box_append(GTK_BOX(root), scroll);
+    GtkWidget *count = gtk_label_new(""); gtk_widget_set_halign(count, GTK_ALIGN_START); gtk_widget_add_css_class(count, "dim-label"); gtk_box_append(GTK_BOX(root), count);
+    gtk_window_set_child(GTK_WINDOW(win), root);
+    g_object_set_data_full(G_OBJECT(win), "ctx", new ManagerCtx{b, list, search, count}, +[](gpointer p) { delete static_cast<ManagerCtx *>(p); });
+    b->manager_win = win;
+    g_signal_connect(win, "destroy", G_CALLBACK(+[](GtkWidget *, gpointer d) { static_cast<Browser *>(d)->manager_win = nullptr; }), b);
+    g_signal_connect(search, "search-changed", G_CALLBACK(+[](GtkSearchEntry *, gpointer d) { manager_populate(static_cast<Browser *>(d)); }), b);
+    g_signal_connect(imp, "clicked", G_CALLBACK(+[](GtkButton *, gpointer d) { show_import_wizard(static_cast<Browser *>(d)); }), b);
+    manager_populate(b);
+    gtk_window_present(GTK_WINDOW(win));
+}
+
+static void show_bookmark_editor(Browser *b, long long id) {
+    Bookmark bm;
+    if (!b->store.get_bookmark(id, &bm)) return;
+    GtkWidget *win = gtk_window_new(); gtk_window_set_application(GTK_WINDOW(win), b->app);
+    gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(b->manager_win ? b->manager_win : b->window));
+    gtk_window_set_modal(GTK_WINDOW(win), TRUE); gtk_window_set_title(GTK_WINDOW(win), "Edit bookmark"); gtk_window_set_default_size(GTK_WINDOW(win), 460, 230);
+    GtkWidget *grid = gtk_grid_new(); gtk_grid_set_row_spacing(GTK_GRID(grid), 8); gtk_grid_set_column_spacing(GTK_GRID(grid), 10);
+    gtk_widget_set_margin_start(grid, 16); gtk_widget_set_margin_end(grid, 16); gtk_widget_set_margin_top(grid, 16); gtk_widget_set_margin_bottom(grid, 16);
+    const char *labels[] = {"Name", "Address", "Folder"};
+    GtkWidget *entries[3];
+    const std::string vals[3] = {bm.title, bm.uri, bm.folder};
+    for (int i = 0; i < 3; ++i) {
+        GtkWidget *l = gtk_label_new(labels[i]); gtk_widget_set_halign(l, GTK_ALIGN_END);
+        entries[i] = gtk_entry_new(); gtk_widget_set_hexpand(entries[i], TRUE); gtk_editable_set_text(GTK_EDITABLE(entries[i]), vals[i].c_str());
+        gtk_grid_attach(GTK_GRID(grid), l, 0, i, 1, 1); gtk_grid_attach(GTK_GRID(grid), entries[i], 1, i, 1, 1);
+    }
+    gtk_entry_set_placeholder_text(GTK_ENTRY(entries[2]), "None. Use Parent / Child for subfolders");
+    GtkWidget *err = gtk_label_new(""); gtk_widget_set_halign(err, GTK_ALIGN_START); gtk_widget_add_css_class(err, "error");
+    gtk_grid_attach(GTK_GRID(grid), err, 1, 3, 1, 1);
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8); gtk_widget_set_halign(row, GTK_ALIGN_END);
+    GtkWidget *cancel = gtk_button_new_with_label("Cancel"); GtkWidget *save = gtk_button_new_with_label("Save"); gtk_widget_add_css_class(save, "suggested-action");
+    gtk_box_append(GTK_BOX(row), cancel); gtk_box_append(GTK_BOX(row), save); gtk_grid_attach(GTK_GRID(grid), row, 0, 4, 2, 1);
+    g_signal_connect_swapped(cancel, "clicked", G_CALLBACK(gtk_window_destroy), win);
+    g_signal_connect_data(save, "clicked", G_CALLBACK(+[](GtkButton *, gpointer d) {
+        auto *c = static_cast<EditCtx *>(d);
+        std::string title = gtk_editable_get_text(GTK_EDITABLE(c->title));
+        std::string uri = normalize_input(gtk_editable_get_text(GTK_EDITABLE(c->uri)));
+        std::string folder = gtk_editable_get_text(GTK_EDITABLE(c->folder));
+        auto trim = [](std::string &v) { auto f = v.find_first_not_of(" \t"); auto l = v.find_last_not_of(" \t"); v = f == std::string::npos ? "" : v.substr(f, l - f + 1); };
+        trim(title); trim(folder);
+        if (uri.empty()) { gtk_label_set_text(GTK_LABEL(c->error), "Enter an address."); return; }
+        if (!c->browser->store.update_bookmark(c->id, title, uri, folder)) { gtk_label_set_text(GTK_LABEL(c->error), "Another bookmark already uses that address."); return; }
+        set_status(c->browser, "Bookmark saved.");
+        Browser *br = c->browser; GtkWidget *w = c->win;
+        gtk_window_destroy(GTK_WINDOW(w)); bookmarks_changed(br);
+    }), new EditCtx{b, id, win, entries[0], entries[1], entries[2], err}, +[](gpointer p, GClosure *) { delete static_cast<EditCtx *>(p); }, GConnectFlags(0));
+    gtk_window_set_child(GTK_WINDOW(win), grid); gtk_window_present(GTK_WINDOW(win));
+}
+
+// ----------------------------------------------------------------- import wizard
+struct ImportCtx {
+    Browser *browser; GtkWidget *win, *list, *status;
+    std::vector<importer::Source> sources;
+    std::vector<GtkWidget *> checks;
+};
+static void import_add_source(ImportCtx *c, const importer::Source &s, bool checked) {
+    GtkWidget *chk = gtk_check_button_new_with_label(s.label.c_str());
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(chk), checked);
+    gtk_widget_set_tooltip_text(chk, s.path.c_str());
+    gtk_box_append(GTK_BOX(c->list), chk);
+    c->sources.push_back(s); c->checks.push_back(chk);
+}
+static void import_run(GtkButton *, gpointer d) {
+    auto *c = static_cast<ImportCtx *>(d);
+    std::vector<Bookmark> all; std::string errors; int picked = 0;
+    for (size_t i = 0; i < c->sources.size(); ++i) {
+        if (!gtk_check_button_get_active(GTK_CHECK_BUTTON(c->checks[i]))) continue;
+        ++picked;
+        std::string err; auto items = importer::load(c->sources[i], &err);
+        if (items.empty() && !err.empty()) errors += c->sources[i].label + ": " + err + "\n";
+        all.insert(all.end(), items.begin(), items.end());
+    }
+    if (!picked) { gtk_label_set_text(GTK_LABEL(c->status), "Tick at least one source, or choose a file."); return; }
+    int added = c->browser->store.import_bookmarks(all);
+    std::string msg = "Imported " + std::to_string(added) + " new bookmark" + (added == 1 ? "" : "s");
+    if ((int)all.size() > added) msg += " (" + std::to_string(all.size() - added) + " already saved)";
+    msg += ".";
+    if (!errors.empty()) msg += "\n" + errors;
+    gtk_label_set_text(GTK_LABEL(c->status), msg.c_str());
+    set_status(c->browser, msg.substr(0, msg.find('\n')));
+    bookmarks_changed(c->browser);
+}
+static void import_choose(GtkButton *, gpointer d) {
+    auto *c = static_cast<ImportCtx *>(d);
+    GtkFileDialog *dlg = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(dlg, "Choose a bookmarks file (HTML export, Chrome 'Bookmarks', or Firefox places.sqlite)");
+    gtk_file_dialog_open(dlg, GTK_WINDOW(c->win), nullptr, +[](GObject *src, GAsyncResult *res, gpointer ud) {
+        auto *ctx = static_cast<ImportCtx *>(ud);
+        GFile *f = gtk_file_dialog_open_finish(GTK_FILE_DIALOG(src), res, nullptr);
+        if (f) {
+            char *path = g_file_get_path(f);
+            if (path) { auto s = importer::classify(path); s.label = std::string("File — ") + g_path_get_basename(path); import_add_source(ctx, s, true); }
+            g_free(path); g_object_unref(f);
+        }
+    }, c);
+    g_object_unref(dlg);
+}
+static void show_import_wizard(Browser *b) {
+    auto *c = new ImportCtx{b, nullptr, nullptr, nullptr, {}, {}};
+    GtkWidget *win = gtk_window_new(); gtk_window_set_application(GTK_WINDOW(win), b->app);
+    gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(b->window));
+    gtk_window_set_title(GTK_WINDOW(win), "Import bookmarks"); gtk_window_set_default_size(GTK_WINDOW(win), 520, 380);
+    g_object_set_data_full(G_OBJECT(win), "ctx", c, +[](gpointer p) { delete static_cast<ImportCtx *>(p); });
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_set_margin_start(root, 18); gtk_widget_set_margin_end(root, 18); gtk_widget_set_margin_top(root, 18); gtk_widget_set_margin_bottom(root, 18);
+    GtkWidget *h = gtk_label_new("Bring your bookmarks along"); gtk_widget_add_css_class(h, "title-2"); gtk_widget_set_halign(h, GTK_ALIGN_START);
+    GtkWidget *d = gtk_label_new("ReedBrowser found these browsers on your computer. Pick what to import, or choose an exported file. Bookmarks you already have are kept, and nothing is deleted.");
+    gtk_label_set_wrap(GTK_LABEL(d), TRUE); gtk_widget_set_halign(d, GTK_ALIGN_START); gtk_label_set_xalign(GTK_LABEL(d), 0);
+    GtkWidget *list = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *scroll = gtk_scrolled_window_new(); gtk_widget_set_vexpand(scroll, TRUE); gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), list);
+    GtkWidget *status = gtk_label_new(""); gtk_label_set_wrap(GTK_LABEL(status), TRUE); gtk_widget_set_halign(status, GTK_ALIGN_START); gtk_label_set_xalign(GTK_LABEL(status), 0);
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *file = gtk_button_new_with_label("Choose file…"); GtkWidget *go = gtk_button_new_with_label("Import selected"); GtkWidget *close = gtk_button_new_with_label("Done");
+    gtk_widget_add_css_class(go, "suggested-action"); gtk_widget_set_hexpand(file, FALSE);
+    GtkWidget *spacer = gtk_label_new(""); gtk_widget_set_hexpand(spacer, TRUE);
+    gtk_box_append(GTK_BOX(row), file); gtk_box_append(GTK_BOX(row), spacer); gtk_box_append(GTK_BOX(row), go); gtk_box_append(GTK_BOX(row), close);
+    for (GtkWidget *w : {h, d, scroll, status, row}) gtk_box_append(GTK_BOX(root), w);
+    c->win = win; c->list = list; c->status = status;
+    auto found = importer::detect_sources();
+    if (found.empty()) { GtkWidget *none = gtk_label_new("No other browsers were detected. Use “Choose file…” to import a bookmarks export (HTML)."); gtk_label_set_wrap(GTK_LABEL(none), TRUE); gtk_widget_set_halign(none, GTK_ALIGN_START); gtk_box_append(GTK_BOX(list), none); }
+    for (const auto &s : found) import_add_source(c, s, true);
+    g_signal_connect(go, "clicked", G_CALLBACK(import_run), c);
+    g_signal_connect(file, "clicked", G_CALLBACK(import_choose), c);
+    g_signal_connect_swapped(close, "clicked", G_CALLBACK(gtk_window_destroy), win);
+    gtk_window_set_child(GTK_WINDOW(win), root); gtk_window_present(GTK_WINDOW(win));
+}
+
+// ======================================================================= extension install from the web
+static bool host_is(const std::string &uri, const char *host) {
+    GUri *u = g_uri_parse(uri.c_str(), G_URI_FLAGS_PARSE_RELAXED, nullptr);
+    bool ok = false;
+    if (u) { const char *h = g_uri_get_host(u); ok = h && g_ascii_strcasecmp(h, host) == 0 && g_strcmp0(g_uri_get_scheme(u), "https") == 0; g_uri_unref(u); }
+    return ok;
+}
+static bool is_trusted_install_host(const std::string &uri) {
+    GUri *u = g_uri_parse(uri.c_str(), G_URI_FLAGS_PARSE_RELAXED, nullptr);
+    bool ok = false;
+    if (u) {
+        std::string h = g_uri_get_host(u) ? g_uri_get_host(u) : "";
+        for (auto &ch : h) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        auto ends = [&](const char *suf) { std::string s2 = suf; return h == s2.substr(1) || (h.size() > s2.size() && h.compare(h.size() - s2.size(), s2.size(), s2) == 0); };
+        ok = g_strcmp0(g_uri_get_scheme(u), "https") == 0 && (ends(".mozilla.org") || ends(".mozilla.net") || ends(".mozaws.net"));
+        g_uri_unref(u);
+    }
+    return ok;
+}
+static bool looks_like_xpi(const std::string &uri) {
+    std::string path = uri.substr(0, uri.find_first_of("?#"));
+    return path.size() > 4 && g_ascii_strcasecmp(path.c_str() + path.size() - 4, ".xpi") == 0;
+}
+
+// Tell the AMO page what happened, so its button shows the right state.
+static void amo_event(WebKitWebView *view, int install_id, const char *event) {
+    if (!view || install_id < 0) return;
+    char *js = g_strdup_printf("window.__reedAmoEvent && window.__reedAmoEvent(%d,'%s');", install_id, event);
+    webkit_web_view_evaluate_javascript(view, js, -1, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_free(js);
+}
+
+struct InstallJob {
+    Browser *browser; GObject *view_ref; std::string source; int install_id; std::string temp; bool ok{false}; std::string error;
+};
+static void install_job_free(InstallJob *j) { if (j->view_ref) g_object_unref(j->view_ref); delete j; }
+
+static void install_download_thread(GTask *task, gpointer, gpointer data, GCancellable *) {
+    auto *j = static_cast<InstallJob *>(data);
+    j->ok = ExtensionManager::fetch_package(j->source, j->temp, &j->error);
+    g_task_return_boolean(task, TRUE);
+}
+static void install_download_done(GObject *, GAsyncResult *, gpointer data) {
+    auto *j = static_cast<InstallJob *>(data);
+    Browser *b = j->browser;
+    WebKitWebView *view = j->view_ref ? WEBKIT_WEB_VIEW(j->view_ref) : nullptr;
+    if (!j->ok) {
+        amo_event(view, j->install_id, "onDownloadFailed");
+        set_status(b, "Download failed.");
+        extension_message(b, "Could not download extension", j->error);
+        install_job_free(j); return;
+    }
+    amo_event(view, j->install_id, "onDownloadEnded");
+    // Consent dialog: show what it asks for before installing.
+    std::string summary;
+    GtkWidget *win = gtk_window_new(); gtk_window_set_application(GTK_WINDOW(win), b->app);
+    gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(b->window)); gtk_window_set_modal(GTK_WINDOW(win), TRUE);
+    gtk_window_set_title(GTK_WINDOW(win), "Add extension to ReedBrowser?"); gtk_window_set_default_size(GTK_WINDOW(win), 480, 220);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_set_margin_start(box, 18); gtk_widget_set_margin_end(box, 18); gtk_widget_set_margin_top(box, 18); gtk_widget_set_margin_bottom(box, 18);
+    std::string text = "Source: " + j->source + "\n\nThis extension will be given every permission its manifest declares. ReedBrowser does not show per-permission prompts yet, so only add extensions you trust.";
+    GtkWidget *label = gtk_label_new(text.c_str()); gtk_label_set_wrap(GTK_LABEL(label), TRUE); gtk_label_set_xalign(GTK_LABEL(label), 0); gtk_label_set_selectable(GTK_LABEL(label), TRUE);
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8); gtk_widget_set_halign(row, GTK_ALIGN_END);
+    GtkWidget *cancel = gtk_button_new_with_label("Cancel"); GtkWidget *add = gtk_button_new_with_label("Add extension"); gtk_widget_add_css_class(add, "suggested-action");
+    gtk_box_append(GTK_BOX(row), cancel); gtk_box_append(GTK_BOX(row), add); gtk_box_append(GTK_BOX(box), label); gtk_box_append(GTK_BOX(box), row);
+    g_object_set_data(G_OBJECT(add), "win", win); g_object_set_data(G_OBJECT(cancel), "win", win);
+    g_signal_connect_data(add, "clicked", G_CALLBACK(+[](GtkButton *, gpointer p) {
+        auto *job = static_cast<InstallJob *>(p);
+        WebKitWebView *v = job->view_ref ? WEBKIT_WEB_VIEW(job->view_ref) : nullptr;
+        amo_event(v, job->install_id, "onInstallStarted");
+        std::string msg; bool ok = job->browser->ext && job->browser->ext->install(job->temp, true, &msg);
+        amo_event(v, job->install_id, ok ? "onInstallEnded" : "onInstallFailed");
+        set_status(job->browser, ok ? "Extension installed." : "Extension install failed.");
+        extension_message(job->browser, ok ? "Extension added" : "Installation failed", msg);
+    }), j, nullptr, GConnectFlags(0));
+    // Whatever button is pressed, the dialog closes and the job (and temp file) is released when it is destroyed.
+    g_signal_connect_swapped(add, "clicked", G_CALLBACK(gtk_window_destroy), win);
+    g_signal_connect_data(cancel, "clicked", G_CALLBACK(+[](GtkButton *, gpointer p) {
+        auto *job = static_cast<InstallJob *>(p);
+        amo_event(job->view_ref ? WEBKIT_WEB_VIEW(job->view_ref) : nullptr, job->install_id, "onInstallCancelled");
+        set_status(job->browser, "Extension install cancelled.");
+    }), j, nullptr, GConnectFlags(0));
+    g_signal_connect_swapped(cancel, "clicked", G_CALLBACK(gtk_window_destroy), win);
+    g_signal_connect_data(win, "destroy", G_CALLBACK(+[](GtkWidget *, gpointer p) {
+        auto *job = static_cast<InstallJob *>(p);
+        std::error_code ec; std::filesystem::remove(job->temp, ec);
+        install_job_free(job);
+    }), j, nullptr, GConnectFlags(0));
+    gtk_window_set_child(GTK_WINDOW(win), box); gtk_window_present(GTK_WINDOW(win));
+    amo_event(view, j->install_id, "onInstallStarted");
+}
+
+static void start_extension_install(Browser *b, WebKitWebView *origin, const std::string &source, int install_id) {
+    if (!b->ext) { extension_message(b, "Extensions unavailable", "The extension runtime is not running."); return; }
+    auto *j = new InstallJob{b, origin ? G_OBJECT(g_object_ref(origin)) : nullptr, source, install_id, "", false, ""};
+    j->temp = b->data_dir + "/web-install-" + std::to_string(g_get_monotonic_time()) + ".xpi";
+    set_status(b, "Downloading extension…");
+    amo_event(origin, install_id, "onDownloadStarted");
+    GTask *task = g_task_new(nullptr, nullptr, install_download_done, j);
+    g_task_set_task_data(task, j, nullptr);
+    g_task_run_in_thread(task, install_download_thread);
+    g_object_unref(task);
+}
+
+// JS injected on addons.mozilla.org: presents the page with the Firefox install API
+// (navigator.mozAddonManager) and adds an "Install in ReedBrowser" button as a fallback.
+static const char *amo_shim_js = R"JS((function(){
+if (window.__reedAmoShim) return; window.__reedAmoShim = true;
+function post(m){ try { window.webkit.messageHandlers.reedAmo.postMessage(JSON.stringify(m)); } catch(e){} }
+var installs = {}, nextId = 1, mgrListeners = {};
+function Install(opts){ this.id = nextId++; this.url = opts.url; this.state = 'STATE_AVAILABLE'; this.error = null; this.maxProgress = -1; this.progress = 0; this._l = {}; installs[this.id] = this; }
+Install.prototype.addEventListener = function(t, f){ (this._l[t] = this._l[t] || []).push(f); };
+Install.prototype.removeEventListener = function(t, f){ var a = this._l[t] || []; var i = a.indexOf(f); if (i >= 0) a.splice(i, 1); };
+Install.prototype.install = function(){ var self = this; return new Promise(function(res, rej){ self._done = {res: res, rej: rej}; post({type: 'install', id: self.id, url: self.url}); }); };
+Install.prototype.cancel = function(){ return Promise.resolve(); };
+window.__reedAmoEvent = function(id, name){
+  var i = installs[id]; if (!i) return;
+  if (name === 'onDownloadStarted') i.state = 'STATE_DOWNLOADING';
+  else if (name === 'onDownloadEnded') i.state = 'STATE_DOWNLOADED';
+  else if (name === 'onInstallStarted') i.state = 'STATE_INSTALLING';
+  else if (name === 'onInstallEnded') i.state = 'STATE_INSTALLED';
+  else if (name === 'onInstallCancelled') i.state = 'STATE_CANCELLED';
+  else { i.state = 'STATE_FAILED'; i.error = name; }
+  var ev = {type: name, id: id, state: i.state, error: i.error};
+  (i._l[name] || []).slice().forEach(function(f){ try { f.call(i, ev); } catch(e){} });
+  if (i._done) {
+    if (name === 'onInstallEnded') i._done.res(); else if (name === 'onInstallCancelled' || /Failed/.test(name)) i._done.rej(new Error(name));
+  }
+};
+var mgr = {
+  permissionPromptsEnabled: true, abuseReportPanelEnabled: false,
+  createInstall: function(opts){ return Promise.resolve(new Install(opts || {})); },
+  getAddonByID: function(){ return Promise.resolve(null); },
+  addEventListener: function(t, f){ (mgrListeners[t] = mgrListeners[t] || []).push(f); },
+  removeEventListener: function(){}
+};
+try { Object.defineProperty(navigator, 'mozAddonManager', {value: mgr, configurable: true}); } catch(e){}
+// Fallback button on add-on pages, in case the site still shows "Download Firefox".
+function slug(){ var m = location.pathname.match(/\/addon\/([^\/]+)/); return m ? decodeURIComponent(m[1]) : null; }
+function ensureButton(){
+  var s = slug(); var b = document.getElementById('reedbrowser-install');
+  if (!s) { if (b) b.remove(); return; }
+  if (b) { b.dataset.slug = s; return; }
+  if (!document.body) return;
+  b = document.createElement('button'); b.id = 'reedbrowser-install'; b.dataset.slug = s; b.textContent = 'Install in ReedBrowser';
+  b.setAttribute('style', 'position:fixed;right:18px;bottom:18px;z-index:2147483647;padding:12px 18px;border:0;border-radius:10px;background:#0060df;color:#fff;font:600 15px system-ui,sans-serif;box-shadow:0 4px 14px rgba(0,0,0,.35);cursor:pointer');
+  b.onclick = function(){ post({type: 'slug', slug: b.dataset.slug}); };
+  document.body.appendChild(b);
+}
+setInterval(ensureButton, 700);
+})();)JS";
+
+static void on_amo_message(WebKitUserContentManager *, JSCValue *value, gpointer data) {
+    auto *view = WEBKIT_WEB_VIEW(data);
+    Browser *b = static_cast<Browser *>(g_object_get_data(G_OBJECT(view), "reed-browser"));
+    const char *page = webkit_web_view_get_uri(view);
+    if (!b || !page || !host_is(page, "addons.mozilla.org") || !jsc_value_is_string(value)) return;  // only the real AMO site may ask
+    char *raw = jsc_value_to_string(value);
+    JsonParser *p = json_parser_new();
+    if (raw && json_parser_load_from_data(p, raw, -1, nullptr)) {
+        JsonObject *o = json_node_get_object(json_parser_get_root(p));
+        std::string type = json_object_get_string_member_with_default(o, "type", "");
+        if (type == "install") {
+            std::string url = json_object_get_string_member_with_default(o, "url", "");
+            int id = static_cast<int>(json_object_get_int_member_with_default(o, "id", -1));
+            if (is_trusted_install_host(url)) start_extension_install(b, view, url, id);
+            else amo_event(view, id, "onInstallFailed");
+        } else if (type == "slug") {
+            std::string slug = json_object_get_string_member_with_default(o, "slug", "");
+            if (!slug.empty() && slug.size() < 200) start_extension_install(b, view, "amo:" + slug, -1);
+        }
+    }
+    g_object_unref(p); g_free(raw);
+}
+
+static void attach_amo_support(Browser *b, WebKitWebView *view, WebKitUserContentManager *ucm) {
+    g_object_set_data(G_OBJECT(view), "reed-browser", b);
+    if (!webkit_user_content_manager_register_script_message_handler(ucm, "reedAmo", nullptr)) return;
+    g_signal_connect(ucm, "script-message-received::reedAmo", G_CALLBACK(on_amo_message), view);
+    const char *allow[] = {"https://addons.mozilla.org/*", nullptr};
+    WebKitUserScript *us = webkit_user_script_new(amo_shim_js, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME, WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, allow, nullptr);
+    webkit_user_content_manager_add_script(ucm, us);
+    webkit_user_script_unref(us);
+}
+
+struct ReedAction { Browser *browser; int tab_id; std::string action; long long id; std::string xpi; };
+static gboolean run_reed_action(gpointer data) {
+    std::unique_ptr<ReedAction> a(static_cast<ReedAction *>(data));
+    Browser *b = a->browser;
+    if (b->shutting_down) return G_SOURCE_REMOVE;
+    if (a->action == "remove") { b->store.delete_bookmark(a->id); set_status(b, "Bookmark removed."); bookmarks_changed(b); }
+    else if (a->action == "edit") show_bookmark_editor(b, a->id);
+    else if (a->action == "manage") show_bookmark_manager(b);
+    else if (a->action == "import") show_import_wizard(b);
+    else if (a->action == "xpi") start_extension_install(b, nullptr, a->xpi, -1);
+    return G_SOURCE_REMOVE;
+}
+static void queue_reed_action(Browser *b, const std::string &action, long long id, const std::string &xpi = "") {
+    g_idle_add(run_reed_action, new ReedAction{b, 0, action, id, xpi});
+}
+
+// reed://<action>[/<id>]?t=<token> from the new-tab page.
+static void handle_reed_uri(Browser *b, WebKitWebView *view, const std::string &uri) {
+    const char *cur = webkit_web_view_get_uri(view);
+    if (cur && g_strcmp0(cur, "about:blank") != 0) return;        // only our own local page
+    auto q = uri.find("?t=");
+    if (q == std::string::npos || uri.substr(q + 3) != b->home_token) return;
+    std::string path = uri.substr(7, q - 7), action = path.substr(0, path.find('/'));
+    long long id = 0;
+    if (path.find('/') != std::string::npos) id = std::atoll(path.c_str() + path.find('/') + 1);
+    if ((action == "remove" || action == "edit") && id <= 0) return;
+    if (action == "remove" || action == "edit" || action == "manage" || action == "import") queue_reed_action(b, action, id);
+}
+
+static void set_site_user_agent(WebKitWebView *view, const std::string &uri) {
+    // addons.mozilla.org only shows "Add to Firefox" to browsers that identify as Firefox.
+    static const char *ff = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0";
+    WebKitSettings *st = webkit_web_view_get_settings(view);
+    bool amo = host_is(uri, "addons.mozilla.org");
+    const char *current = webkit_settings_get_user_agent(st);
+    bool has = current && g_strcmp0(current, ff) == 0;
+    if (amo && !has) webkit_settings_set_user_agent(st, ff);
+    else if (!amo && has && !uri.empty() && uri.rfind("http", 0) == 0) webkit_settings_set_user_agent(st, nullptr);
+}
+
+static gboolean on_decide_policy(WebKitWebView *view, WebKitPolicyDecision *decision, WebKitPolicyDecisionType type, gpointer data) {
+    Tab *tab = static_cast<Tab *>(data);
+    Browser *b = tab->browser;
+    if (type == WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION || type == WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION) {
+        WebKitNavigationAction *na = webkit_navigation_policy_decision_get_navigation_action(WEBKIT_NAVIGATION_POLICY_DECISION(decision));
+        WebKitURIRequest *req = webkit_navigation_action_get_request(na);
+        const char *u = req ? webkit_uri_request_get_uri(req) : nullptr;
+        if (!u) return FALSE;
+        std::string uri = u;
+        if (uri.rfind("reed://", 0) == 0) { webkit_policy_decision_ignore(decision); handle_reed_uri(b, view, uri); return TRUE; }
+        if (!tab->private_mode && looks_like_xpi(uri) && uri.rfind("https://", 0) == 0) {
+            webkit_policy_decision_ignore(decision); queue_reed_action(b, "xpi", 0, uri); return TRUE;
+        }
+        set_site_user_agent(view, uri);
+    } else if (type == WEBKIT_POLICY_DECISION_TYPE_RESPONSE && !tab->private_mode) {
+        WebKitResponsePolicyDecision *rd = WEBKIT_RESPONSE_POLICY_DECISION(decision);
+        WebKitURIResponse *resp = webkit_response_policy_decision_get_response(rd);
+        const char *mime = webkit_uri_response_get_mime_type(resp);
+        const char *u = webkit_uri_response_get_uri(resp);
+        if (mime && u && g_strcmp0(mime, "application/x-xpinstall") == 0 && g_str_has_prefix(u, "https://")) {
+            webkit_policy_decision_ignore(decision); queue_reed_action(b, "xpi", 0, u); return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 static void on_menu_action(GtkButton *button, gpointer data) {
     Browser *b = static_cast<Browser *>(data); int action = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "action"));
     if (action == 0) create_tab(b, false, "", false);
     else if (action == 1) { create_tab(b, true, "", false); set_status(b, "Private tab: history and site data are not saved."); }
     else if (action == 2) show_settings(b);
     else if (action == 3) set_theme(b, "dark");
+    else if (action == 5) show_bookmark_manager(b);
+    else if (action == 6) show_import_wizard(b);
     else set_theme(b, "system");
     GtkWidget *p = gtk_widget_get_parent(GTK_WIDGET(button)); if (p) p = gtk_widget_get_parent(p); if (p && GTK_IS_POPOVER(p)) gtk_popover_popdown(GTK_POPOVER(p));
 }
@@ -890,8 +1385,8 @@ static void activate(GtkApplication *app, gpointer data) {
     gtk_widget_set_tooltip_text(menu_button, "ReedBrowser menu");
     GtkWidget *popover = gtk_popover_new(); GtkWidget *menu_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
     gtk_widget_set_margin_start(menu_box, 8); gtk_widget_set_margin_end(menu_box, 8); gtk_widget_set_margin_top(menu_box, 8); gtk_widget_set_margin_bottom(menu_box, 8);
-    const char *menu_labels[] = {"New tab", "New private tab", "Settings & extensions", "Dark mode", "System theme"};
-    for (int i=0;i<5;i++) { GtkWidget *item=gtk_button_new_with_label(menu_labels[i]); gtk_widget_add_css_class(item,"flat"); g_object_set_data(G_OBJECT(item),"action",GINT_TO_POINTER(i)); g_signal_connect(item,"clicked",G_CALLBACK(on_menu_action),b); gtk_box_append(GTK_BOX(menu_box),item); }
+    const char *menu_labels[] = {"New tab", "New private tab", "Settings & extensions", "Dark mode", "System theme", "Bookmarks (Ctrl+Shift+O)", "Import bookmarks…"};
+    for (int i=0;i<7;i++) { GtkWidget *item=gtk_button_new_with_label(menu_labels[i]); gtk_widget_add_css_class(item,"flat"); g_object_set_data(G_OBJECT(item),"action",GINT_TO_POINTER(i)); g_signal_connect(item,"clicked",G_CALLBACK(on_menu_action),b); gtk_box_append(GTK_BOX(menu_box),item); }
     gtk_popover_set_child(GTK_POPOVER(popover),menu_box); gtk_menu_button_set_popover(GTK_MENU_BUTTON(menu_button),popover); gtk_box_append(GTK_BOX(b->toolbar),menu_button);
     g_signal_connect(b->address, "activate", G_CALLBACK(on_address_activate), b);
 
@@ -944,6 +1439,13 @@ static void activate(GtkApplication *app, gpointer data) {
     GtkEventController *keys = gtk_event_controller_key_new();
     g_signal_connect(keys, "key-pressed", G_CALLBACK(on_key_pressed), b);
     gtk_widget_add_controller(b->window, keys);
+
+    // First run: offer to import bookmarks from other browsers (once, and only if the user has none yet).
+    if (b->store.meta("import_offered").empty()) {
+        b->store.set_meta("import_offered", "1");
+        if (b->store.count_bookmarks() == 0)
+            g_idle_add(+[](gpointer d) -> gboolean { show_import_wizard(static_cast<Browser *>(d)); return G_SOURCE_REMOVE; }, b);
+    }
 
     int restore_active = 0;
     auto restore = b->store.load_session(&restore_active);
@@ -1016,6 +1518,7 @@ int main(int argc, char **argv) {
     }
     Browser browser;
     browser.data_dir = home_path(".local/share/reedbrowser");
+    { gchar *tok = g_uuid_string_random(); browser.home_token = tok; g_free(tok); }
     browser.cache_dir = home_path(".cache/reedbrowser");
     g_mkdir_with_parents(browser.data_dir.c_str(), 0700);
     g_mkdir_with_parents(browser.cache_dir.c_str(), 0700);
