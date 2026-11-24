@@ -162,6 +162,7 @@ struct Ext {
     std::vector<std::function<void()>> waiting;  // messages sent before the background page finished loading
 
     // toolbar action / extension pages
+    bool webreq_listening = false;  // a webRequest listener is registered (observe-only)
     bool has_action = false;
     std::string popup, options_page, default_title, icon_rel;
     // declarativeNetRequest
@@ -1444,6 +1445,58 @@ bool ExtensionManager::Impl::dispatch_cookies(MsgCtx *c, const std::string &op, 
     return true;
 }
 
+// ---------------------------------------------------------------- webRequest (observe-only)
+static const char *guess_type(const std::string &url, bool main) {
+    if (main) return "main_frame";
+    std::string u = url.substr(0, url.find_first_of("?#"));
+    auto ends = [&](const char *x) { size_t n = strlen(x); return u.size() >= n && g_ascii_strcasecmp(u.c_str() + u.size() - n, x) == 0; };
+    if (ends(".js") || ends(".mjs")) return "script";
+    if (ends(".css")) return "stylesheet";
+    if (ends(".png") || ends(".jpg") || ends(".jpeg") || ends(".gif") || ends(".webp") || ends(".svg") || ends(".ico") || ends(".avif")) return "image";
+    if (ends(".woff") || ends(".woff2") || ends(".ttf") || ends(".otf")) return "font";
+    if (ends(".mp4") || ends(".webm") || ends(".mp3") || ends(".ogg")) return "media";
+    if (ends(".html") || ends(".htm")) return "sub_frame";
+    return "xmlhttprequest";
+}
+
+static void webreq_emit(ExtensionManager::Impl *d, const char *event, WebKitWebView *view, const std::string &id, const std::string &url,
+                        const std::string &method, const std::string &type, int status) {
+    int tab = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(view), "reed-tab-id"));
+    const char *doc = webkit_web_view_get_uri(view);
+    std::string det = "{\"requestId\":" + quote(id) + ",\"url\":" + quote(url) + ",\"method\":" + quote(method) + ",\"type\":" + quote(type) +
+                      ",\"tabId\":" + std::to_string(tab) + ",\"frameId\":0,\"parentFrameId\":-1,\"timeStamp\":" + std::to_string(g_get_real_time() / 1000.0) +
+                      ",\"originUrl\":" + quote(doc ? doc : "") + ",\"documentUrl\":" + quote(doc ? doc : "");
+    if (status) det += ",\"statusCode\":" + std::to_string(status);
+    det += "}";
+    for (auto &e : d->exts) if (e->enabled && e->bg && e->bg_ready && e->webreq_listening && e->has_permission("webRequest")) d->fire(*e, event, "[" + det + "]", false);
+}
+
+static void on_resource_started(WebKitWebView *view, WebKitWebResource *res, WebKitURIRequest *req, gpointer ud) {
+    auto *d = static_cast<ExtensionManager::Impl *>(ud);
+    static unsigned counter = 0;
+    std::string id = std::to_string(++counter);
+    const char *u = webkit_uri_request_get_uri(req);
+    std::string url = u ? u : "";
+    if (url.rfind("http", 0) != 0) return;
+    const char *m = webkit_uri_request_get_http_method(req);
+    std::string method = m ? m : "GET";
+    bool main = res == webkit_web_view_get_main_resource(view);
+    std::string type = guess_type(url, main);
+    webreq_emit(d, "webRequest.onBeforeRequest", view, id, url, method, type, 0);
+    struct Ctx { ExtensionManager::Impl *d; WebKitWebView *view; std::string id, url, method, type; };
+    auto *c = new Ctx{d, view, id, url, method, type};
+    g_object_ref(view);
+    g_signal_connect_data(res, "finished", G_CALLBACK(+[](WebKitWebResource *r, gpointer p) {
+        auto *x = static_cast<Ctx *>(p);
+        WebKitURIResponse *resp = webkit_web_resource_get_response(r);
+        webreq_emit(x->d, "webRequest.onCompleted", x->view, x->id, x->url, x->method, x->type, resp ? static_cast<int>(webkit_uri_response_get_status_code(resp)) : 0);
+    }), c, +[](gpointer p, GClosure *) { auto *x = static_cast<Ctx *>(p); g_object_unref(x->view); delete x; }, GConnectFlags(0));
+    g_signal_connect(res, "failed", G_CALLBACK(+[](WebKitWebResource *, GError *, gpointer p) {
+        auto *x = static_cast<Ctx *>(p);
+        webreq_emit(x->d, "webRequest.onErrorOccurred", x->view, x->id, x->url, x->method, x->type, 0);
+    }), c);
+}
+
 // ---------------------------------------------------------------- the extra API operations
 static JsonArray *arr_of(JsonObject *o, const char *k) {
     JsonNode *n = member(o, k);
@@ -1461,6 +1514,7 @@ bool ExtensionManager::Impl::dispatch_extra(MsgCtx *c, const std::string &op, Js
     const std::string world = "reed-ext-" + e.uuid;
 
     // ---- ports (runtime.connect / tabs.connect)
+    if (op == "webreq.listen") { e.webreq_listening = true; respond_ok(r, "null"); return true; }
     if (op == "port.connect") {
         std::string id = str_of(args, "id"), name = str_of(args, "name");
         PortEnd from = end_of(c), to;
@@ -1813,6 +1867,8 @@ void ExtensionManager::attach_view(WebKitWebView *view, WebKitUserContentManager
         info.attached.push_back(&e);
     }
     for (auto &up : d_->exts) if (up->enabled && up->dnr_filter) webkit_user_content_manager_add_filter(ucm, up->dnr_filter);
+    g_object_set_data(G_OBJECT(view), "reed-tab-id", GINT_TO_POINTER(tab_id));
+    g_signal_connect(view, "resource-load-started", G_CALLBACK(on_resource_started), d_.get());
     d_->views[view] = info;
     d_->tab_views[tab_id] = view;
 }

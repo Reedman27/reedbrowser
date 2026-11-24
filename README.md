@@ -90,6 +90,14 @@ rpmbuild -ba packaging/reedbrowser.spec
 | Ctrl+T | New tab |
 | Ctrl+W | Close tab |
 | Ctrl+Shift+N | New private tab |
+| Ctrl+Shift+T | Reopen closed tab |
+| Ctrl+Shift+O | Bookmark manager |
+| Ctrl+Shift+B | Show/hide bookmarks bar |
+| Ctrl+H | History |
+| Ctrl+J | Downloads |
+| Ctrl+P | Print |
+| Ctrl+U | View page source |
+| F11 | Full screen |
 | Ctrl+L / F6 | Focus address bar |
 | Ctrl+R / F5 | Reload |
 | Alt+Left / Alt+Right | Back / forward |

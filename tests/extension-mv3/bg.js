@@ -46,3 +46,7 @@ browser.webNavigation.onCompleted.addListener((d) => set("webnav", d.url));
   await set("cookie_host_all", (await browser.cookies.getAll({})).map((c) => c.domain + ":" + c.name));
   await set("cookie_host_url", (await browser.cookies.getAll({ url: "http://example.test/" })).length);
 })().catch((e) => set("cookie_host_error", String(e)));
+const seen = [];
+browser.webRequest.onBeforeRequest.addListener((d) => { seen.push(d.type + ":" + d.url.split("/").pop()); }, { urls: ["http://127.0.0.1/*"] });
+browser.webRequest.onCompleted.addListener((d) => { if (d.url.endsWith("index.html") || d.url.endsWith(":8099/")) set("webreq_completed_status", d.statusCode); }, { urls: ["<all_urls>"] });
+setTimeout(() => set("webreq_seen", seen.slice(0, 8)), 4000);

@@ -283,13 +283,46 @@ const permissions = wrapAll({
 permissions.onAdded = inertEv("permissions.onAdded");
 permissions.onRemoved = inertEv("permissions.onRemoved");
 
+// Observe-only webRequest: WebKitGTK cannot block or rewrite requests synchronously, so listeners
+// are notified (onBeforeRequest / onCompleted / onErrorOccurred) and "blocking" responses are ignored.
+function patternToRegExp(p) {
+    if (p === "<all_urls>") return /^(https?|wss?|ftp):\/\//;
+    const m = /^(\*|https?|wss?|ftp):\/\/([^\/]*)(\/.*)$/.exec(p);
+    if (!m) return null;
+    const esc = (t) => t.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+    const scheme = m[1] === "*" ? "https?" : m[1];
+    let host = m[2] === "*" ? "[^/]*" : m[2].startsWith("*.") ? "(?:[^/]*\\.)?" + esc(m[2].slice(2)) : esc(m[2]);
+    return new RegExp("^" + scheme + ":\\/\\/" + host + "(?::\\d+)?" + esc(m[3]) + "$");
+}
+class ReqEv extends Ev {
+    constructor(name) { super(name); this._f = new Map(); }
+    addListener(f, filter) {
+        if (typeof f !== "function") return;
+        this._l.add(f);
+        const urls = (filter && filter.urls) || ["<all_urls>"];
+        this._f.set(f, { res: urls.map(patternToRegExp).filter(Boolean), types: filter && filter.types, tabId: filter && filter.tabId });
+        post("webreq.listen").catch(() => {});
+    }
+    removeListener(f) { this._l.delete(f); this._f.delete(f); }
+    _fire(d) {
+        for (const f of [...this._l]) {
+            const flt = this._f.get(f);
+            if (flt) {
+                if (flt.res.length && !flt.res.some((r) => r.test(d.url))) continue;
+                if (flt.types && !flt.types.includes(d.type)) continue;
+                if (flt.tabId !== undefined && flt.tabId !== d.tabId) continue;
+            }
+            try { f(d); } catch (e) { console.error(e); }
+        }
+    }
+}
 const webRequest = wrapAll({
     handlerBehaviorChanged: () => undefined,
     filterResponseData: () => { report("webRequest.filterResponseData"); throw new Error("webRequest.filterResponseData is not supported by ReedBrowser"); },
     MAX_HANDLER_BEHAVIOR_CHANGED_CALLS_PER_10_MINUTES: 20,
 });
-for (const n of ["onBeforeRequest", "onBeforeSendHeaders", "onSendHeaders", "onHeadersReceived", "onAuthRequired",
-                 "onResponseStarted", "onBeforeRedirect", "onCompleted", "onErrorOccurred"])
+for (const n of ["onBeforeRequest", "onCompleted", "onErrorOccurred"]) webRequest[n] = (events["webRequest." + n] = new ReqEv("webRequest." + n));
+for (const n of ["onBeforeSendHeaders", "onSendHeaders", "onHeadersReceived", "onAuthRequired", "onResponseStarted", "onBeforeRedirect"])
     webRequest[n] = inertEv("webRequest." + n);
 
 const webNavigation = wrapAll({
