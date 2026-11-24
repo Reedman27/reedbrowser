@@ -50,6 +50,7 @@ public:
     void tab_created(int id);
     void tab_removed(int id);
     void tab_activated(int id);
+    void tab_committed(int id, const std::string &url);  // top-frame navigation committed (webNavigation events)
     void tab_updated(int id, const std::string &status, const std::string &url, const std::string &title);
     int extension_count() const;
 

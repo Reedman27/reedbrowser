@@ -1,5 +1,5 @@
 {"manifest_version":3,"name":"Reed MV3 Compat Test","version":"1.0","browser_specific_settings":{"gecko":{"id":"reedmv3@example.org"}},
- "permissions":["storage","tabs","scripting","declarativeNetRequest"],"host_permissions":["<all_urls>"],
+ "permissions":["storage","tabs","scripting","declarativeNetRequest","cookies","webNavigation"],"host_permissions":["<all_urls>"],
  "background":{"scripts":["bg.js"]},
  "action":{"default_popup":"popup.html","default_title":"Compat test","default_icon":{"48":"icon.svg"}},
  "options_ui":{"page":"options.html"},

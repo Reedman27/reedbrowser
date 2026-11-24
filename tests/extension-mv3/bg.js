@@ -31,3 +31,18 @@ browser.tabs.onUpdated.addListener(async (id, change, tab) => {
 
 // Scripts registered at runtime only apply to pages loaded afterwards, so reload what is open.
 setTimeout(() => browser.tabs.query({}).then((ts) => ts.forEach((t) => browser.tabs.reload(t.id))), 1500);
+browser.webNavigation.onCompleted.addListener((d) => set("webnav", d.url));
+(async () => {
+  const u = "http://127.0.0.1:8099/";
+  await browser.cookies.set({ url: u, name: "t", value: "v1" });
+  const c = await browser.cookies.get({ url: u, name: "t" });
+  await set("cookie", c && c.value);
+  await set("cookie_all", (await browser.cookies.getAll({ url: u })).length);
+  await browser.cookies.remove({ url: u, name: "t" });
+  await set("cookie_removed", (await browser.cookies.get({ url: u, name: "t" })) === null);
+})().catch((e) => set("cookie_error", String(e)));
+(async () => {
+  await browser.cookies.set({ url: "http://example.test/", name: "n", value: "v2", domain: "example.test", path: "/" });
+  await set("cookie_host_all", (await browser.cookies.getAll({})).map((c) => c.domain + ":" + c.name));
+  await set("cookie_host_url", (await browser.cookies.getAll({ url: "http://example.test/" })).length);
+})().catch((e) => set("cookie_host_error", String(e)));

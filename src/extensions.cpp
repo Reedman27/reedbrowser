@@ -220,6 +220,7 @@ struct ExtensionManager::Impl {
     PortEnd end_of(MsgCtx *c);
     void deliver_to(Ext &e, const PortEnd &to, const std::string &body, const std::string &param);
     void drop_ports_for(WebKitWebView *view);
+    bool dispatch_cookies(MsgCtx *c, const std::string &op, JsonObject *args, ReplyHandle *r);
     bool dispatch_extra(MsgCtx *c, const std::string &op, JsonObject *args, const std::string &sender_url, bool top, ReplyHandle *r);
     WebKitWebView *tab_view_for(JsonNode *id_node);
     void add_registered_to(Ext &e, Ext::Reg &g, WebKitUserContentManager *ucm);
@@ -1336,6 +1337,113 @@ void ExtensionManager::Impl::rebuild_dnr(Ext &e) {
     g_bytes_unref(bytes);
 }
 
+
+// ---------------------------------------------------------------- cookies
+static std::string cookie_json(SoupCookie *c) {
+    const char *dom = soup_cookie_get_domain(c);
+    std::string d = dom ? dom : "";
+    GDateTime *exp = soup_cookie_get_expires(c);
+    const char *ss = "no_restriction";
+    switch (soup_cookie_get_same_site_policy(c)) { case SOUP_SAME_SITE_POLICY_LAX: ss = "lax"; break; case SOUP_SAME_SITE_POLICY_STRICT: ss = "strict"; break; default: break; }
+    std::string o = "{\"name\":" + quote(soup_cookie_get_name(c)) + ",\"value\":" + quote(soup_cookie_get_value(c)) + ",\"domain\":" + quote(d) +
+        ",\"hostOnly\":" + (!d.empty() && d[0] == '.' ? "false" : "true") + ",\"path\":" + quote(soup_cookie_get_path(c)) +
+        ",\"secure\":" + (soup_cookie_get_secure(c) ? "true" : "false") + ",\"httpOnly\":" + (soup_cookie_get_http_only(c) ? "true" : "false") +
+        ",\"sameSite\":\"" + ss + "\",\"session\":" + (exp ? "false" : "true") + ",\"storeId\":\"0\",\"firstPartyDomain\":\"\"";
+    if (exp) o += ",\"expirationDate\":" + std::to_string(static_cast<double>(g_date_time_to_unix(exp)));
+    return o + "}";
+}
+static bool cookie_domain_matches(const std::string &cookie_dom, const std::string &want) {
+    auto strip = [](std::string x) { if (!x.empty() && x[0] == '.') x.erase(0, 1); return x; };
+    std::string c = strip(cookie_dom), w = strip(want);
+    return c == w || (c.size() > w.size() && c.compare(c.size() - w.size() - 1, w.size() + 1, "." + w) == 0);
+}
+static bool cookie_matches(SoupCookie *c, JsonObject *f) {
+    if (!f) return true;
+    std::string name = str_of(f, "name"), path = str_of(f, "path"), domain = str_of(f, "domain");
+    if (!name.empty() && name != soup_cookie_get_name(c)) return false;
+    if (!path.empty() && path != soup_cookie_get_path(c)) return false;
+    if (!domain.empty() && !cookie_domain_matches(soup_cookie_get_domain(c), domain)) return false;
+    if (member(f, "secure") && bool_of(f, "secure") != (soup_cookie_get_secure(c) != FALSE)) return false;
+    if (member(f, "session") && bool_of(f, "session") != (soup_cookie_get_expires(c) == nullptr)) return false;
+    return true;
+}
+static WebKitCookieManager *cookie_manager_for(WebKitNetworkSession *s) { return webkit_network_session_get_cookie_manager(s); }
+
+bool ExtensionManager::Impl::dispatch_cookies(MsgCtx *c, const std::string &op, JsonObject *args, ReplyHandle *r) {
+    Ext &e = *c->ext;
+    if (!e.has_permission("cookies")) { respond_err(r, "The \"cookies\" permission is required."); return true; }
+    WebKitCookieManager *cm = cookie_manager_for(session);
+    JsonNode *dn = member(args, "d");
+    JsonObject *d = dn && JSON_NODE_HOLDS_OBJECT(dn) ? json_node_get_object(dn) : nullptr;
+    struct Job { Impl *mgr; ReplyHandle *r; Json filter; std::string op, url; };
+    if (op == "cookies.getAllCookieStores") { respond_ok(r, "[{\"id\":\"0\",\"incognito\":false,\"tabIds\":[]}]"); return true; }
+    std::string url = str_of(d, "url");
+    if (op == "cookies.set") {
+        std::string name = str_of(d, "name"), value = str_of(d, "value"), domain = str_of(d, "domain"), path = str_of(d, "path", "/");
+        if (url.empty() && domain.empty()) { respond_err(r, "cookies.set requires a url"); return true; }
+        if (domain.empty()) { GUri *u = g_uri_parse(url.c_str(), G_URI_FLAGS_PARSE_RELAXED, nullptr); if (u) { domain = g_uri_get_host(u) ? g_uri_get_host(u) : ""; g_uri_unref(u); } }
+        SoupCookie *ck = soup_cookie_new(name.c_str(), value.c_str(), domain.c_str(), path.c_str(), -1);
+        if (bool_of(d, "secure")) soup_cookie_set_secure(ck, TRUE);
+        if (bool_of(d, "httpOnly")) soup_cookie_set_http_only(ck, TRUE);
+        std::string ss = str_of(d, "sameSite");
+        if (ss == "strict") soup_cookie_set_same_site_policy(ck, SOUP_SAME_SITE_POLICY_STRICT);
+        else if (ss == "lax") soup_cookie_set_same_site_policy(ck, SOUP_SAME_SITE_POLICY_LAX);
+        else if (ss == "no_restriction" && bool_of(d, "secure")) soup_cookie_set_same_site_policy(ck, SOUP_SAME_SITE_POLICY_NONE);  // SameSite=None needs Secure
+        if (JsonNode *ex = member(d, "expirationDate"); ex && JSON_NODE_HOLDS_VALUE(ex)) {
+            GDateTime *dt = g_date_time_new_from_unix_utc(static_cast<gint64>(json_node_get_double(ex)));
+            if (dt) { soup_cookie_set_expires(ck, dt); g_date_time_unref(dt); }
+        }
+        struct SetJob { Impl *mgr; ReplyHandle *r; std::string out; SoupCookie *ck; };
+        auto *sj = new SetJob{this, r, cookie_json(ck), ck};  // the cookie must outlive the async call
+        webkit_cookie_manager_add_cookie(cm, ck, nullptr, [](GObject *src, GAsyncResult *res, gpointer ud) {
+            std::unique_ptr<SetJob> j(static_cast<SetJob *>(ud));
+            GError *err = nullptr;
+            gboolean ok = webkit_cookie_manager_add_cookie_finish(WEBKIT_COOKIE_MANAGER(src), res, &err);
+            if (err || !ok) { j->mgr->respond_err(j->r, err ? err->message : "could not set cookie"); if (err) g_error_free(err); }
+            else j->mgr->respond_ok(j->r, j->out);
+            soup_cookie_free(j->ck);
+        }, sj);
+        return true;
+    }
+    // get / getAll / remove: fetch candidate cookies, then filter
+    auto *job = new Job{this, r, Json(), op, url};
+    if (d) { JsonNode *cp = json_node_init_object(json_node_alloc(), d); job->filter = Json(cp); }
+    auto finish = +[](GObject *src, GAsyncResult *res, gpointer ud) {
+        std::unique_ptr<Job> j(static_cast<Job *>(ud));
+        GError *err = nullptr;
+        GList *list = j->url.empty() ? webkit_cookie_manager_get_all_cookies_finish(WEBKIT_COOKIE_MANAGER(src), res, &err)
+                                     : webkit_cookie_manager_get_cookies_finish(WEBKIT_COOKIE_MANAGER(src), res, &err);
+        if (err) { j->mgr->respond_err(j->r, err->message); g_error_free(err); return; }
+        JsonObject *f = j->filter.obj();
+        std::vector<SoupCookie *> hits;
+        for (GList *l = list; l; l = l->next) if (cookie_matches(static_cast<SoupCookie *>(l->data), f)) hits.push_back(static_cast<SoupCookie *>(l->data));
+        if (j->op == "cookies.getAll") {
+            std::string out = "[";
+            for (size_t i = 0; i < hits.size(); ++i) { if (i) out += ","; out += cookie_json(hits[i]); }
+            j->mgr->respond_ok(j->r, out + "]");
+        } else if (j->op == "cookies.get") {
+            // most specific path first
+            std::sort(hits.begin(), hits.end(), [](SoupCookie *a, SoupCookie *b) { return strlen(soup_cookie_get_path(a)) > strlen(soup_cookie_get_path(b)); });
+            j->mgr->respond_ok(j->r, hits.empty() ? "null" : cookie_json(hits[0]));
+        } else {  // remove
+            if (hits.empty()) { j->mgr->respond_ok(j->r, "null"); }
+            else {
+                std::string reply = "{\"url\":" + quote(j->url) + ",\"name\":" + quote(soup_cookie_get_name(hits[0])) + ",\"storeId\":\"0\"}";
+                webkit_cookie_manager_delete_cookie(WEBKIT_COOKIE_MANAGER(src), hits[0], nullptr, [](GObject *s2, GAsyncResult *r2, gpointer u2) {
+                    auto *p = static_cast<std::pair<Impl *, std::pair<ReplyHandle *, std::string>> *>(u2);
+                    webkit_cookie_manager_delete_cookie_finish(WEBKIT_COOKIE_MANAGER(s2), r2, nullptr);
+                    p->first->respond_ok(p->second.first, p->second.second);
+                    delete p;
+                }, new std::pair<Impl *, std::pair<ReplyHandle *, std::string>>(j->mgr, {j->r, reply}));
+            }
+        }
+        g_list_free_full(list, reinterpret_cast<GDestroyNotify>(soup_cookie_free));
+    };
+    if (url.empty()) webkit_cookie_manager_get_all_cookies(cm, nullptr, finish, job);
+    else webkit_cookie_manager_get_cookies(cm, url.c_str(), nullptr, finish, job);
+    return true;
+}
+
 // ---------------------------------------------------------------- the extra API operations
 static JsonArray *arr_of(JsonObject *o, const char *k) {
     JsonNode *n = member(o, k);
@@ -1498,6 +1606,8 @@ bool ExtensionManager::Impl::dispatch_extra(MsgCtx *c, const std::string &op, Js
         respond_ok(r, out + "]");
         return true;
     }
+
+    if (op.rfind("cookies.", 0) == 0) return dispatch_cookies(c, op, args, r);
 
     // ---- declarativeNetRequest
     if (op.rfind("dnr.", 0) == 0) {
@@ -1722,7 +1832,17 @@ static std::string tab_args(ExtensionManager::Impl *d, int id) {
 void ExtensionManager::tab_created(int id) { d_->fire_all("tabs.onCreated", "[" + tab_args(d_.get(), id) + "]"); }
 void ExtensionManager::tab_removed(int id) { d_->fire_all("tabs.onRemoved", "[" + std::to_string(id) + ",{\"windowId\":1,\"isWindowClosing\":false}]"); }
 void ExtensionManager::tab_activated(int id) { d_->fire_all("tabs.onActivated", "[{\"tabId\":" + std::to_string(id) + ",\"windowId\":1}]"); }
+void ExtensionManager::tab_committed(int id, const std::string &url) {
+    std::string d = "[{\"tabId\":" + std::to_string(id) + ",\"url\":" + quote(url) + ",\"frameId\":0,\"parentFrameId\":-1,\"processId\":-1,\"timeStamp\":" + std::to_string(g_get_real_time() / 1000) + ",\"transitionType\":\"link\",\"transitionQualifiers\":[]}]";
+    d_->fire_all("webNavigation.onBeforeNavigate", d);
+    d_->fire_all("webNavigation.onCommitted", d);
+}
 void ExtensionManager::tab_updated(int id, const std::string &status, const std::string &url, const std::string &title) {
+    if (status == "complete" && !url.empty()) {
+        std::string d = "[{\"tabId\":" + std::to_string(id) + ",\"url\":" + quote(url) + ",\"frameId\":0,\"parentFrameId\":-1,\"processId\":-1,\"timeStamp\":" + std::to_string(g_get_real_time() / 1000) + "}]";
+        d_->fire_all("webNavigation.onDOMContentLoaded", d);
+        d_->fire_all("webNavigation.onCompleted", d);
+    }
     if (status == "loading") { auto tv = d_->tab_views.find(id); if (tv != d_->tab_views.end()) d_->drop_ports_for(tv->second); }  // new document: old content-script ports are gone
     std::string change = "{\"status\":" + quote(status);
     if (!url.empty()) change += ",\"url\":" + quote(url);

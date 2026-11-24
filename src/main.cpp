@@ -401,6 +401,7 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer
     } else if (event == WEBKIT_LOAD_COMMITTED) {
         const char *uri = webkit_web_view_get_uri(view);
         tab->uri = uri ? uri : "";
+        if (b->ext && !tab->private_mode && uri) b->ext->tab_committed(tab->id, uri);
         if (active_tab(b) == tab) update_chrome(b, tab);
     } else if (event == WEBKIT_LOAD_FINISHED) {
         gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(b->progress), 1.0);

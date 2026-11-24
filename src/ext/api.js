@@ -292,9 +292,19 @@ for (const n of ["onBeforeRequest", "onBeforeSendHeaders", "onSendHeaders", "onH
                  "onResponseStarted", "onBeforeRedirect", "onCompleted", "onErrorOccurred"])
     webRequest[n] = inertEv("webRequest." + n);
 
-const webNavigation = wrapAll({ getFrame: () => null, getAllFrames: () => [] });
-for (const n of ["onBeforeNavigate", "onCommitted", "onDOMContentLoaded", "onCompleted", "onCreatedNavigationTarget", "onErrorOccurred", "onHistoryStateUpdated", "onReferenceFragmentUpdated"])
-    webNavigation[n] = inertEv("webNavigation." + n);
+const webNavigation = wrapAll({
+    getFrame: (d) => post("tabs.get", { id: d.tabId }).then((t) => ({ errorOccurred: false, url: t.url, parentFrameId: -1, processId: -1, frameId: 0 })),
+    getAllFrames: (d) => post("tabs.get", { id: d.tabId }).then((t) => [{ errorOccurred: false, url: t.url, parentFrameId: -1, processId: -1, frameId: 0 }]),
+});
+for (const n of ["onBeforeNavigate", "onCommitted", "onDOMContentLoaded", "onCompleted"]) webNavigation[n] = ev("webNavigation." + n);  // top frame only
+for (const n of ["onCreatedNavigationTarget", "onErrorOccurred", "onHistoryStateUpdated", "onReferenceFragmentUpdated"]) webNavigation[n] = inertEv("webNavigation." + n);
+
+const cookies = wrapAll({
+    get: (d) => post("cookies.get", { d }), getAll: (d) => post("cookies.getAll", { d: d || {} }),
+    set: (d) => post("cookies.set", { d }), remove: (d) => post("cookies.remove", { d }),
+    getAllCookieStores: () => post("cookies.getAllCookieStores", {}),
+});
+cookies.onChanged = inertEv("cookies.onChanged");
 
 const menus = wrapAll({ create: () => 1, update: () => undefined, remove: () => undefined, removeAll: () => undefined, refresh: () => undefined });
 menus.onClicked = inertEv("menus.onClicked");
@@ -352,7 +362,7 @@ const declarativeNetRequest = wrapAll({
 // ---- assemble -----------------------------------------------------------------
 const real = {
     runtime, storage, tabs, windows, alarms, i18n, permissions, webRequest, webNavigation, menus, contextMenus: menus,
-    commands, privacy, management, scripting, contentScripts, declarativeNetRequest,
+    commands, privacy, management, cookies, scripting, contentScripts, declarativeNetRequest,
     extension: { getURL: runtime.getURL, inIncognitoContext: false, getBackgroundPage: () => (isBg ? window : null) },
     browserAction: actionApi(), action: actionApi(), pageAction: actionApi(),
     dns: wrapAll({ resolve: () => { report("dns.resolve"); throw new Error("dns.resolve is not supported by ReedBrowser"); } }),
