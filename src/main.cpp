@@ -90,6 +90,10 @@ static void rebuild_bookmark_bar(Browser *b);
 static void toggle_bookmark_bar(Browser *b);
 static void show_downloads(Browser *b);
 static void reopen_closed_tab(Browser *b);
+static void show_history(Browser *b);
+static void print_page(Browser *b);
+static void view_source(Browser *b);
+static void toggle_fullscreen(Browser *b);
 static void open_extension_options(Browser *b, const std::string &uuid);
 static void show_extension_manager(Browser *b);
 static void start_extension_install(Browser *b, WebKitWebView *origin, const std::string &source, int install_id);
@@ -686,6 +690,10 @@ static gboolean on_key_pressed(GtkEventControllerKey *, guint keyval, guint, Gdk
     if (ctrl && (keyval == GDK_KEY_l || keyval == GDK_KEY_L)) { gtk_widget_grab_focus(b->address); gtk_editable_select_region(GTK_EDITABLE(b->address), 0, -1); return TRUE; }
     if (ctrl && shift && (keyval == GDK_KEY_t || keyval == GDK_KEY_T)) { reopen_closed_tab(b); return TRUE; }
     if (ctrl && shift && (keyval == GDK_KEY_b || keyval == GDK_KEY_B)) { toggle_bookmark_bar(b); return TRUE; }
+    if (ctrl && !shift && (keyval == GDK_KEY_h || keyval == GDK_KEY_H)) { show_history(b); return TRUE; }
+    if (ctrl && !shift && (keyval == GDK_KEY_p || keyval == GDK_KEY_P)) { print_page(b); return TRUE; }
+    if (ctrl && !shift && (keyval == GDK_KEY_u || keyval == GDK_KEY_U)) { view_source(b); return TRUE; }
+    if (keyval == GDK_KEY_F11) { toggle_fullscreen(b); return TRUE; }
     if (ctrl && !shift && (keyval == GDK_KEY_j || keyval == GDK_KEY_J)) { show_downloads(b); return TRUE; }
     if (ctrl && (keyval == GDK_KEY_t || keyval == GDK_KEY_T)) { create_tab(b, false, "", false); return TRUE; }
     if (ctrl && (keyval == GDK_KEY_w || keyval == GDK_KEY_W)) { if (tab) close_tab(b, tab); return TRUE; }
@@ -1571,6 +1579,66 @@ static void show_downloads(Browser *b) {
     gtk_window_set_child(GTK_WINDOW(win), root); gtk_window_present(GTK_WINDOW(win));
 }
 
+// ======================================================================= history window, print, view source, fullscreen
+struct HistCtx { Browser *browser; GtkWidget *list, *search; };
+static void history_populate(HistCtx *c) {
+    while (GtkWidget *ch = gtk_widget_get_first_child(c->list)) gtk_list_box_remove(GTK_LIST_BOX(c->list), ch);
+    const char *q = gtk_editable_get_text(GTK_EDITABLE(c->search));
+    auto rows = c->browser->store.history(q ? q : "", 300);
+    for (auto &r : rows) {
+        GtkWidget *col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 1);
+        gtk_widget_set_margin_start(col, 8); gtk_widget_set_margin_end(col, 8); gtk_widget_set_margin_top(col, 4); gtk_widget_set_margin_bottom(col, 4);
+        GtkWidget *t = gtk_label_new((r.title.empty() ? r.uri : r.title).c_str()); gtk_widget_set_halign(t, GTK_ALIGN_START); gtk_label_set_ellipsize(GTK_LABEL(t), PANGO_ELLIPSIZE_END); gtk_label_set_xalign(GTK_LABEL(t), 0);
+        GtkWidget *u = gtk_label_new(r.uri.c_str()); gtk_widget_set_halign(u, GTK_ALIGN_START); gtk_widget_add_css_class(u, "dim-label"); gtk_label_set_ellipsize(GTK_LABEL(u), PANGO_ELLIPSIZE_END); gtk_label_set_xalign(GTK_LABEL(u), 0);
+        gtk_box_append(GTK_BOX(col), t); gtk_box_append(GTK_BOX(col), u);
+        GtkWidget *row = gtk_list_box_row_new(); gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), col);
+        g_object_set_data_full(G_OBJECT(row), "uri", g_strdup(r.uri.c_str()), g_free);
+        gtk_list_box_append(GTK_LIST_BOX(c->list), row);
+    }
+}
+static void show_history(Browser *b) {
+    GtkWidget *win = gtk_window_new(); gtk_window_set_application(GTK_WINDOW(win), b->app);
+    gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(b->window));
+    gtk_window_set_title(GTK_WINDOW(win), "History"); gtk_window_set_default_size(GTK_WINDOW(win), 640, 560);
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_start(root, 12); gtk_widget_set_margin_end(root, 12); gtk_widget_set_margin_top(root, 12); gtk_widget_set_margin_bottom(root, 12);
+    GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *search = gtk_search_entry_new(); gtk_widget_set_hexpand(search, TRUE);
+    GtkWidget *clear = gtk_button_new_with_label("Clear history");
+    gtk_box_append(GTK_BOX(top), search); gtk_box_append(GTK_BOX(top), clear);
+    GtkWidget *list = gtk_list_box_new();
+    GtkWidget *scroll = gtk_scrolled_window_new(); gtk_widget_set_vexpand(scroll, TRUE); gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), list);
+    gtk_box_append(GTK_BOX(root), top); gtk_box_append(GTK_BOX(root), scroll);
+    auto *ctx = new HistCtx{b, list, search};
+    g_object_set_data_full(G_OBJECT(win), "ctx", ctx, +[](gpointer p) { delete static_cast<HistCtx *>(p); });
+    g_signal_connect(search, "search-changed", G_CALLBACK(+[](GtkSearchEntry *, gpointer d) { history_populate(static_cast<HistCtx *>(d)); }), ctx);
+    g_signal_connect(clear, "clicked", G_CALLBACK(+[](GtkButton *, gpointer d) { auto *c = static_cast<HistCtx *>(d); c->browser->store.clear_history(); history_populate(c); refresh_home_tabs(c->browser); }), ctx);
+    g_signal_connect(list, "row-activated", G_CALLBACK(+[](GtkListBox *, GtkListBoxRow *row, gpointer d) {
+        auto *c = static_cast<HistCtx *>(d);
+        const char *u = static_cast<const char *>(g_object_get_data(G_OBJECT(row), "uri"));
+        if (u) create_tab(c->browser, false, u, false);
+    }), ctx);
+    history_populate(ctx);
+    gtk_window_set_child(GTK_WINDOW(win), root); gtk_window_present(GTK_WINDOW(win));
+}
+
+static void print_page(Browser *b) {
+    Tab *t = active_tab(b);
+    if (!t) return;
+    WebKitPrintOperation *op = webkit_print_operation_new(t->view);
+    webkit_print_operation_run_dialog(op, GTK_WINDOW(b->window));
+    g_object_unref(op);
+}
+static void view_source(Browser *b) {
+    Tab *t = active_tab(b);
+    const char *u = t ? webkit_web_view_get_uri(t->view) : nullptr;
+    if (!u || !(g_str_has_prefix(u, "http://") || g_str_has_prefix(u, "https://"))) { set_status(b, "Only website pages have a source view."); return; }
+    create_tab(b, false, (std::string("view-source:") + u).c_str(), false);
+}
+static void toggle_fullscreen(Browser *b) {
+    if (gtk_window_is_fullscreen(GTK_WINDOW(b->window))) gtk_window_unfullscreen(GTK_WINDOW(b->window)); else gtk_window_fullscreen(GTK_WINDOW(b->window));
+}
+
 static void on_menu_action(GtkButton *button, gpointer data) {
     Browser *b = static_cast<Browser *>(data); int action = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "action"));
     if (action == 0) create_tab(b, false, "", false);
@@ -1583,6 +1651,10 @@ static void on_menu_action(GtkButton *button, gpointer data) {
     else if (action == 8) show_downloads(b);
     else if (action == 9) reopen_closed_tab(b);
     else if (action == 10) toggle_bookmark_bar(b);
+    else if (action == 11) show_history(b);
+    else if (action == 12) print_page(b);
+    else if (action == 13) view_source(b);
+    else if (action == 14) toggle_fullscreen(b);
     else set_theme(b, "system");
     GtkWidget *p = gtk_widget_get_parent(GTK_WIDGET(button)); if (p) p = gtk_widget_get_parent(p); if (p && GTK_IS_POPOVER(p)) gtk_popover_popdown(GTK_POPOVER(p));
 }
@@ -1665,8 +1737,8 @@ static void activate(GtkApplication *app, gpointer data) {
     gtk_widget_set_tooltip_text(menu_button, "ReedBrowser menu");
     GtkWidget *popover = gtk_popover_new(); GtkWidget *menu_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
     gtk_widget_set_margin_start(menu_box, 8); gtk_widget_set_margin_end(menu_box, 8); gtk_widget_set_margin_top(menu_box, 8); gtk_widget_set_margin_bottom(menu_box, 8);
-    const char *menu_labels[] = {"New tab", "New private tab", "Settings & extensions", "Dark mode", "System theme", "Bookmarks (Ctrl+Shift+O)", "Import bookmarks…", "Extensions", "Downloads (Ctrl+J)", "Reopen closed tab (Ctrl+Shift+T)", "Show/hide bookmarks bar (Ctrl+Shift+B)"};
-    for (int i=0;i<11;i++) { GtkWidget *item=gtk_button_new_with_label(menu_labels[i]); gtk_widget_add_css_class(item,"flat"); g_object_set_data(G_OBJECT(item),"action",GINT_TO_POINTER(i)); g_signal_connect(item,"clicked",G_CALLBACK(on_menu_action),b); gtk_box_append(GTK_BOX(menu_box),item); }
+    const char *menu_labels[] = {"New tab", "New private tab", "Settings & extensions", "Dark mode", "System theme", "Bookmarks (Ctrl+Shift+O)", "Import bookmarks…", "Extensions", "Downloads (Ctrl+J)", "Reopen closed tab (Ctrl+Shift+T)", "Show/hide bookmarks bar (Ctrl+Shift+B)", "History (Ctrl+H)", "Print (Ctrl+P)", "View page source (Ctrl+U)", "Full screen (F11)"};
+    for (int i=0;i<15;i++) { GtkWidget *item=gtk_button_new_with_label(menu_labels[i]); gtk_widget_add_css_class(item,"flat"); g_object_set_data(G_OBJECT(item),"action",GINT_TO_POINTER(i)); g_signal_connect(item,"clicked",G_CALLBACK(on_menu_action),b); gtk_box_append(GTK_BOX(menu_box),item); }
     gtk_popover_set_child(GTK_POPOVER(popover),menu_box); gtk_menu_button_set_popover(GTK_MENU_BUTTON(menu_button),popover); gtk_box_append(GTK_BOX(b->toolbar),menu_button);
     g_signal_connect(b->address, "activate", G_CALLBACK(on_address_activate), b);
 
