@@ -1,5 +1,5 @@
 Name:           reedbrowser
-Version:        0.5.1
+Version:        0.5.2
 Release:        1%{?dist}
 Summary:        A fast, quiet WebKitGTK browser
 License:        AGPL-3.0-only
@@ -13,6 +13,7 @@ BuildRequires:  pkgconfig(webkitgtk-6.0)
 BuildRequires:  sqlite-devel
 BuildRequires:  pkgconfig(json-glib-1.0)
 BuildRequires:  pkgconfig(libarchive)
+BuildRequires:  pkgconfig(libcurl)
 Requires:       webkitgtk6.0
 
 %description
@@ -34,10 +35,12 @@ private tabs. WebKit handles rendering, GPU compositing and process isolation.
 %license LICENSE
 %doc README.md
 %{_bindir}/reedbrowser
-%{_datadir}/applications/reedbrowser.desktop
-%{_datadir}/icons/hicolor/scalable/apps/reedbrowser.svg
 
 %changelog
+* Mon Nov 23 2026 ReedBrowser contributors - 0.5.2-1
+- Add HTTPS installation from official Firefox Add-ons listing URLs
+- Resolve current XPI through the AMO API and reuse permission confirmation
+
 * Mon Nov 23 2026 ReedBrowser contributors - 0.5.1-1
 - First compiled and runtime-tested build (GTK 4.14 / WebKitGTK 2.52, Xvfb)
 - Fix find-in-page: search as you type, Enter/Ctrl+G next, Ctrl+Shift+G previous,

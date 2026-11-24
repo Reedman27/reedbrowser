@@ -2,6 +2,10 @@
 
 WebKitGTK only parses manifests and match patterns. Everything else is `src/extensions.cpp` + `src/ext/api.js`.
 
+## Installing from Firefox Add-ons (AMO)
+
+The CLI installer accepts a public AMO add-on page URL (for example `https://addons.mozilla.org/firefox/addon/ublock-origin/`) or `amo:<slug>`. It resolves the current release through the official AMO API, downloads the XPI over HTTPS, then runs the same manifest/permission/consent checks as a local XPI. This installs the package; it does **not** imply full Firefox API compatibility. In this preview, the user supplies the listing URL to the CLI; clicking AMO’s in-page “Add to Firefox” button is not yet connected to the native installer.
+
 ## How it works
 - Extensions live in `~/.local/share/reedbrowser/extensions/<id>/`; registry in `registry.json`; storage in `extension-data/<uuid>/`.
 - `moz-extension://<uuid>/...` served by a custom URI scheme (path traversal blocked).
@@ -18,7 +22,7 @@ runtime (id, getURL, getManifest, sendMessage, onMessage, onInstalled, onStartup
 2. `runtime.connect` ports, `tabs.executeScript/insertCSS`, `contentScripts.register`, `filterResponseData`, `dns`.
 3. Popup/options UI, toolbar buttons, context menus, commands.
 4. Proton Pass needs popup UI + ports + autofill content scripts; untested.
-5. Per-site permission prompts; extension auto-update; AMO install.
+5. Per-site permission prompts and extension auto-update. AMO package download/install is implemented in the 0.5.2 CLI preview; in-page Add to Firefox integration is not yet connected.
 
 ## Tested
 `tests/extension/` (content script, CSS, content→background message with reply, background→content `tabs.sendMessage`, storage persistence, onInstalled) under Xvfb on Ubuntu with WebKitGTK 2.52. Not tested on Fedora 45 or with real extensions.

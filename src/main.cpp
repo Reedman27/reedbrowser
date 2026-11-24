@@ -17,6 +17,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <utility>
 
 #include "store.hpp"
 #include "extensions.hpp"
@@ -50,6 +51,11 @@ struct Browser {
     GtkWidget *address{};
     GtkWidget *status{};
     GtkWidget *progress{};
+    std::string theme{"system"};
+    std::string accent{"#3584e4"};
+    std::string density{"comfortable"};
+    std::string tab_position{"left"};
+    int ui_font_size{100};
     GtkWidget *find_revealer{};
     GtkWidget *find_entry{};
     GtkWidget *find_count{};
@@ -149,6 +155,9 @@ static Tab *active_tab(Browser *b) {
 static std::string homepage_html(Browser *b, bool private_mode) {
     std::string html = R"HTML(<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>New Tab</title><style>
 :root{color-scheme:light dark}*{box-sizing:border-box}body{margin:0;background:#f5f6f8;color:#20242b;font:15px system-ui,-apple-system,sans-serif}.wrap{max-width:760px;margin:12vh auto 0;padding:28px}.brand{font-size:34px;font-weight:650;letter-spacing:-1.4px;margin-bottom:8px}.sub{color:#747b86;margin-bottom:28px}.search{display:flex;background:white;border:1px solid #dce0e6;border-radius:12px;padding:14px 17px;box-shadow:0 4px 18px #1720330b}.search input{border:0;outline:0;background:transparent;color:inherit;width:100%;font:inherit}.section{margin-top:34px}.heading{font-size:12px;font-weight:700;letter-spacing:.09em;color:#747b86;margin-bottom:12px}.links{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:9px}.link{display:block;padding:12px 14px;border:1px solid #e0e3e8;border-radius:10px;background:#fff;color:inherit;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.link:hover{border-color:#8b9bb6;background:#fafbfc}.muted{color:#858c96;font-size:13px}@media(prefers-color-scheme:dark){body{background:#17191e;color:#e7e9ed}.search,.link{background:#22252c;border-color:#343943}.link:hover{background:#292d35;border-color:#68758a}.sub,.heading,.muted{color:#9ba3b0}}</style></head><body><main class="wrap"><div class="brand">ReedBrowser</div><div class="sub">A quieter place to browse.</div><form class="search" action="https://duckduckgo.com/" method="get"><input name="q" autofocus placeholder="Search the web or enter an address" aria-label="Search"></form>)HTML";
+    html += "<style>:root{--reed-accent:" + b->accent + ";} .brand{color:var(--reed-accent)}.search:focus-within{border-color:var(--reed-accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--reed-accent) 22%,transparent)}.link:hover{border-color:var(--reed-accent)!important}</style>";
+    if (b->theme == "dark") html += "<style>:root{color-scheme:dark}body{background:#17191e!important;color:#e7e9ed!important}.search,.link{background:#22252c!important;border-color:#343943!important;color:#e7e9ed!important}.sub,.heading,.muted{color:#9ba3b0!important}</style>";
+    else if (b->theme == "light") html += "<style>:root{color-scheme:light}body{background:#f5f6f8!important;color:#20242b!important}.search,.link{background:white!important;color:#20242b!important}</style>";
     auto bookmarks = b->store.bookmarks();
     html += "<section class=\"section\"><div class=\"heading\">BOOKMARKS</div><div class=\"links\">";
     if (bookmarks.empty()) html += "<span class=\"muted\">Your saved sites will appear here.</span>";
@@ -643,6 +652,184 @@ static gboolean on_key_pressed(GtkEventControllerKey *, guint keyval, guint, Gdk
     return FALSE;
 }
 
+
+static void save_preferences(Browser *b) {
+    GKeyFile *kf = g_key_file_new();
+    g_key_file_set_string(kf, "appearance", "theme", b->theme.c_str());
+    g_key_file_set_string(kf, "appearance", "accent", b->accent.c_str());
+    g_key_file_set_string(kf, "appearance", "density", b->density.c_str());
+    g_key_file_set_integer(kf, "appearance", "ui-font-size", b->ui_font_size);
+    g_key_file_set_string(kf, "tabs", "position", b->tab_position.c_str());
+    gsize len = 0; gchar *data = g_key_file_to_data(kf, &len, nullptr);
+    std::string path = b->data_dir + "/preferences.ini";
+    g_file_set_contents(path.c_str(), data, static_cast<gssize>(len), nullptr);
+    g_free(data); g_key_file_unref(kf);
+}
+static bool valid_hex_color(const std::string &v) {
+    if (v.size() != 7 || v[0] != '#') return false;
+    return std::all_of(v.begin() + 1, v.end(), [](unsigned char c){ return std::isxdigit(c) != 0; });
+}
+static void apply_custom_css(Browser *b) {
+    if (!gdk_display_get_default()) return;
+    char *css = g_strdup_printf(
+        "button.suggested-action, button:checked { background:%s; color:white; }"
+        ".toolbar button:hover, .notebook tab:checked { border-color:%s; }"
+        ".address-entry:focus-within { border-color:%s; box-shadow:0 0 0 2px alpha(%s,.22); }"
+        ".toolbar { font-size:%d%%; }",
+        b->accent.c_str(), b->accent.c_str(), b->accent.c_str(), b->accent.c_str(), b->ui_font_size);
+    GtkCssProvider *provider = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(provider, css, -1);
+    gtk_style_context_add_provider_for_display(gdk_display_get_default(), GTK_STYLE_PROVIDER(provider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
+    g_object_unref(provider); g_free(css);
+}
+static void set_theme(Browser *b, const std::string &theme) {
+    b->theme = theme == "dark" || theme == "light" ? theme : "system";
+    GtkSettings *settings = gtk_settings_get_default();
+    if (settings && g_object_class_find_property(G_OBJECT_GET_CLASS(settings), "gtk-application-prefer-dark-theme"))
+        g_object_set(settings, "gtk-application-prefer-dark-theme", b->theme == "dark", nullptr);
+    for (auto &tab : b->tabs) {
+        const char *uri = webkit_web_view_get_uri(tab->view);
+        if (!uri || g_strcmp0(uri, "about:blank") == 0) load_home(tab.get());
+    }
+    save_preferences(b);
+    set_status(b, b->theme == "dark" ? "Dark mode enabled." : b->theme == "light" ? "Light mode enabled." : "Following system appearance.");
+}
+static void load_theme(Browser *b) {
+    GKeyFile *kf = g_key_file_new();
+    std::string path = b->data_dir + "/preferences.ini";
+    if (g_key_file_load_from_file(kf, path.c_str(), G_KEY_FILE_NONE, nullptr)) {
+        gchar *v = g_key_file_get_string(kf, "appearance", "theme", nullptr); if (v) { b->theme = v; g_free(v); }
+        v = g_key_file_get_string(kf, "appearance", "accent", nullptr); if (v) { if (valid_hex_color(v)) b->accent = v; g_free(v); }
+        v = g_key_file_get_string(kf, "appearance", "density", nullptr); if (v) { b->density = v; g_free(v); }
+        v = g_key_file_get_string(kf, "tabs", "position", nullptr); if (v) { b->tab_position = v; g_free(v); }
+        GError *err = nullptr; int size = g_key_file_get_integer(kf, "appearance", "ui-font-size", &err); if (!err && size >= 80 && size <= 140) b->ui_font_size = size; if (err) g_error_free(err);
+    }
+    g_key_file_unref(kf);
+    if (b->theme != "dark" && b->theme != "light") b->theme = "system";
+    if (b->density != "compact" && b->density != "comfortable" && b->density != "spacious") b->density = "comfortable";
+    if (b->tab_position != "top" && b->tab_position != "bottom" && b->tab_position != "left" && b->tab_position != "right") b->tab_position = "left";
+    GtkSettings *settings = gtk_settings_get_default();
+    if (settings && g_object_class_find_property(G_OBJECT_GET_CLASS(settings), "gtk-application-prefer-dark-theme"))
+        g_object_set(settings, "gtk-application-prefer-dark-theme", b->theme == "dark", nullptr);
+}
+static void apply_appearance(Browser *b) {
+    apply_custom_css(b);
+    if (b->notebook) {
+        GtkPositionType pos = b->tab_position == "top" ? GTK_POS_TOP : b->tab_position == "bottom" ? GTK_POS_BOTTOM : b->tab_position == "right" ? GTK_POS_RIGHT : GTK_POS_LEFT;
+        gtk_notebook_set_tab_pos(GTK_NOTEBOOK(b->notebook), pos);
+    }
+    if (b->toolbar) {
+        const char *klass = b->density == "compact" ? "compact-ui" : b->density == "spacious" ? "spacious-ui" : "comfortable-ui";
+        gtk_widget_remove_css_class(b->toolbar, "compact-ui"); gtk_widget_remove_css_class(b->toolbar, "spacious-ui"); gtk_widget_remove_css_class(b->toolbar, "comfortable-ui");
+        gtk_widget_add_css_class(b->toolbar, klass);
+    }
+    save_preferences(b);
+}
+static void extension_message(Browser *b, const std::string &title, const std::string &message) {
+    GtkWidget *win = gtk_window_new();
+    gtk_window_set_application(GTK_WINDOW(win), b->app);
+    gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(b->window));
+    gtk_window_set_modal(GTK_WINDOW(win), TRUE); gtk_window_set_title(GTK_WINDOW(win), title.c_str()); gtk_window_set_default_size(GTK_WINDOW(win), 420, 150);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_set_margin_start(box, 18); gtk_widget_set_margin_end(box, 18); gtk_widget_set_margin_top(box, 18); gtk_widget_set_margin_bottom(box, 18);
+    GtkWidget *label = gtk_label_new(message.c_str()); gtk_label_set_wrap(GTK_LABEL(label), TRUE); gtk_box_append(GTK_BOX(box), label);
+    GtkWidget *button = gtk_button_new_with_label("Close"); gtk_widget_set_halign(button, GTK_ALIGN_END); gtk_box_append(GTK_BOX(box), button);
+    g_signal_connect_swapped(button, "clicked", G_CALLBACK(gtk_window_destroy), win);
+    gtk_window_set_child(GTK_WINDOW(win), box); gtk_window_present(GTK_WINDOW(win));
+}
+struct ExtAction { Browser *browser; GtkWidget *entry; };
+struct InstallConfirm { Browser *browser; std::string source; GtkWidget *window; };
+static void confirm_extension_install(GtkButton *, gpointer data) {
+    auto *c = static_cast<InstallConfirm *>(data);
+    Browser *browser = c->browser; GtkWidget *window = c->window; std::string source = c->source;
+    std::string msg; bool ok = browser->ext && browser->ext->install(source, true, &msg);
+    gtk_window_destroy(GTK_WINDOW(window));
+    extension_message(browser, ok ? "Extension installed" : "Installation failed", msg + (ok ? "\n\nRestart ReedBrowser to load it." : ""));
+}
+static void install_extension_clicked(GtkButton *, gpointer data) {
+    auto *a = static_cast<ExtAction *>(data); const char *v = gtk_editable_get_text(GTK_EDITABLE(a->entry));
+    if (!v || !*v) { extension_message(a->browser, "Install extension", "Paste an addons.mozilla.org URL or a local XPI/ZIP path."); return; }
+    GtkWidget *win = gtk_window_new(); gtk_window_set_application(GTK_WINDOW(win), a->browser->app);
+    gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(a->browser->window)); gtk_window_set_modal(GTK_WINDOW(win), TRUE);
+    gtk_window_set_title(GTK_WINDOW(win), "Confirm extension installation"); gtk_window_set_default_size(GTK_WINDOW(win), 470, 210);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12); gtk_widget_set_margin_start(box, 18); gtk_widget_set_margin_end(box, 18); gtk_widget_set_margin_top(box, 18); gtk_widget_set_margin_bottom(box, 18);
+    GtkWidget *label = gtk_label_new("Install this extension? ReedBrowser will grant the permissions declared in its manifest. Per-site permission prompts are not implemented yet. Only install extensions you trust.");
+    gtk_label_set_wrap(GTK_LABEL(label), TRUE); gtk_widget_set_halign(label, GTK_ALIGN_START); gtk_box_append(GTK_BOX(box), label);
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8); gtk_widget_set_halign(row, GTK_ALIGN_END);
+    GtkWidget *cancel = gtk_button_new_with_label("Cancel"); GtkWidget *install = gtk_button_new_with_label("Install and grant permissions");
+    gtk_box_append(GTK_BOX(row), cancel); gtk_box_append(GTK_BOX(row), install); gtk_box_append(GTK_BOX(box), row);
+    auto *confirm = new InstallConfirm{a->browser, v, win};
+    g_signal_connect_data(install, "clicked", G_CALLBACK(confirm_extension_install), confirm, +[](gpointer p, GClosure*){ delete static_cast<InstallConfirm*>(p); }, GConnectFlags(0));
+    g_signal_connect_swapped(cancel, "clicked", G_CALLBACK(gtk_window_destroy), win);
+    gtk_window_set_child(GTK_WINDOW(win), box); gtk_window_present(GTK_WINDOW(win));
+}
+static void remove_extension_clicked(GtkButton *, gpointer data) {
+    auto *a = static_cast<ExtAction *>(data); const char *v = gtk_editable_get_text(GTK_EDITABLE(a->entry));
+    if (!v || !*v) { extension_message(a->browser, "Remove extension", "Enter the extension name or ID shown in the installed list."); return; }
+    std::string msg; bool ok = a->browser->ext && a->browser->ext->remove(v, &msg);
+    extension_message(a->browser, ok ? "Extension removed" : "Removal failed", msg);
+}
+static GtkWidget *settings_section(const char *title, const char *description, GtkWidget *parent) {
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    GtkWidget *label = gtk_label_new(title); gtk_widget_add_css_class(label, "title-3"); gtk_widget_set_halign(label, GTK_ALIGN_START); gtk_box_append(GTK_BOX(box), label);
+    GtkWidget *desc = gtk_label_new(description); gtk_label_set_wrap(GTK_LABEL(desc), TRUE); gtk_widget_add_css_class(desc, "dim-label"); gtk_widget_set_halign(desc, GTK_ALIGN_START); gtk_box_append(GTK_BOX(box), desc);
+    gtk_box_append(GTK_BOX(parent), box); return box;
+}
+struct AccentApplyData { Browser *browser; GtkWidget *entry; };
+static void show_settings(Browser *b) {
+    GtkWidget *win = gtk_window_new(); gtk_window_set_application(GTK_WINDOW(win), b->app);
+    gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(b->window)); gtk_window_set_title(GTK_WINDOW(win), "ReedBrowser Settings"); gtk_window_set_default_size(GTK_WINDOW(win), 860, 650);
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    GtkWidget *header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10); gtk_widget_set_margin_start(header, 20); gtk_widget_set_margin_end(header, 20); gtk_widget_set_margin_top(header, 16); gtk_widget_set_margin_bottom(header, 14);
+    GtkWidget *title = gtk_label_new("Settings"); gtk_widget_add_css_class(title, "title-1"); gtk_widget_set_hexpand(title, TRUE); gtk_widget_set_halign(title, GTK_ALIGN_START);
+    GtkWidget *close = gtk_button_new_with_label("Done"); gtk_box_append(GTK_BOX(header), title); gtk_box_append(GTK_BOX(header), close); gtk_box_append(GTK_BOX(root), header); g_signal_connect_swapped(close, "clicked", G_CALLBACK(gtk_window_destroy), win);
+    GtkWidget *search = gtk_search_entry_new(); gtk_widget_set_margin_start(search, 20); gtk_widget_set_margin_end(search, 20); gtk_widget_set_margin_bottom(search, 12); gtk_box_append(GTK_BOX(root), search);
+    GtkWidget *pages = gtk_notebook_new(); gtk_notebook_set_tab_pos(GTK_NOTEBOOK(pages), GTK_POS_LEFT); gtk_widget_set_vexpand(pages, TRUE); gtk_box_append(GTK_BOX(root), pages);
+    auto page = [&](const char *name) { GtkWidget *sc = gtk_scrolled_window_new(); GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 18); gtk_widget_set_margin_start(box, 24); gtk_widget_set_margin_end(box, 24); gtk_widget_set_margin_top(box, 22); gtk_widget_set_margin_bottom(box, 22); gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sc), box); gtk_notebook_append_page(GTK_NOTEBOOK(pages), sc, gtk_label_new(name)); return box; };
+    GtkWidget *appearance = page("Appearance");
+    settings_section("Color theme", "Choose a browser theme independently of your desktop.", appearance);
+    const char *theme_options[] = {"System default", "Light", "Dark", nullptr};
+    GtkWidget *theme = gtk_drop_down_new_from_strings(theme_options);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(theme), b->theme == "dark" ? 2 : b->theme == "light" ? 1 : 0); gtk_widget_set_halign(theme, GTK_ALIGN_START); gtk_widget_set_size_request(theme, 240, -1); gtk_box_append(GTK_BOX(appearance), theme);
+    g_signal_connect(theme, "notify::selected", G_CALLBACK(+[](GObject *o, GParamSpec*, gpointer d){ guint v=gtk_drop_down_get_selected(GTK_DROP_DOWN(o)); set_theme(static_cast<Browser*>(d), v==2?"dark":v==1?"light":"system"); }), b);
+    settings_section("Accent color", "Choose a preset or enter any HEX color such as #8b5cf6.", appearance);
+    GtkWidget *presets = gtk_flow_box_new(); gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(presets), GTK_SELECTION_NONE); gtk_flow_box_set_max_children_per_line(GTK_FLOW_BOX(presets), 8); gtk_flow_box_set_row_spacing(GTK_FLOW_BOX(presets), 8); gtk_flow_box_set_column_spacing(GTK_FLOW_BOX(presets), 8);
+    const char *colors[] = {"#3584e4","#e66100","#26a269","#9141ac","#c01c28","#1c71d8","#986a44","#5e5c64","#d33682","#00a6a6"};
+    for (const char *color : colors) { GtkWidget *swatch=gtk_button_new_with_label("●"); gtk_widget_set_size_request(swatch,42,38); char *css=g_strdup_printf("button{color:%s;font-size:22px;border:2px solid %s;}",color,color); GtkCssProvider *cp=gtk_css_provider_new(); gtk_css_provider_load_from_data(cp,css,-1); gtk_style_context_add_provider(gtk_widget_get_style_context(swatch),GTK_STYLE_PROVIDER(cp),GTK_STYLE_PROVIDER_PRIORITY_APPLICATION); g_object_unref(cp); g_free(css); g_object_set_data_full(G_OBJECT(swatch),"accent",g_strdup(color),g_free); g_signal_connect(swatch,"clicked",G_CALLBACK(+[](GtkButton *bt,gpointer d){Browser *br=static_cast<Browser*>(d); br->accent=static_cast<const char*>(g_object_get_data(G_OBJECT(bt),"accent")); apply_appearance(br);}),b); gtk_flow_box_append(GTK_FLOW_BOX(presets),swatch); }
+    gtk_box_append(GTK_BOX(appearance), presets);
+    GtkWidget *custom_row=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8); GtkWidget *hex=gtk_entry_new(); gtk_entry_set_placeholder_text(GTK_ENTRY(hex),b->accent.c_str()); gtk_editable_set_text(GTK_EDITABLE(hex),b->accent.c_str()); gtk_widget_set_hexpand(hex,TRUE); GtkWidget *apply=gtk_button_new_with_label("Apply custom color"); gtk_box_append(GTK_BOX(custom_row),hex); gtk_box_append(GTK_BOX(custom_row),apply); gtk_box_append(GTK_BOX(appearance),custom_row);
+    auto *hexdata=new AccentApplyData{b,hex}; g_signal_connect_data(apply,"clicked",G_CALLBACK(+[](GtkButton*,gpointer p){auto *v=static_cast<AccentApplyData*>(p); const char *c=gtk_editable_get_text(GTK_EDITABLE(v->entry)); std::string color=c?c:""; if (!valid_hex_color(color)){extension_message(v->browser,"Invalid accent color","Enter a six-digit HEX color, for example #3584e4.");return;} v->browser->accent=color; apply_appearance(v->browser);}),hexdata,+[](gpointer p,GClosure*){delete static_cast<AccentApplyData*>(p);},GConnectFlags(0));
+    settings_section("Interface density", "Adjust spacing throughout the browser toolbar.", appearance);
+    const char *density_options[] = {"Compact","Comfortable","Spacious",nullptr}; GtkWidget *density=gtk_drop_down_new_from_strings(density_options); gtk_drop_down_set_selected(GTK_DROP_DOWN(density),b->density=="compact"?0:b->density=="spacious"?2:1); gtk_widget_set_halign(density,GTK_ALIGN_START); gtk_widget_set_size_request(density,240,-1); gtk_box_append(GTK_BOX(appearance),density);
+    g_signal_connect(density,"notify::selected",G_CALLBACK(+[](GObject*o,GParamSpec*,gpointer d){Browser*br=static_cast<Browser*>(d);guint v=gtk_drop_down_get_selected(GTK_DROP_DOWN(o));br->density=v==0?"compact":v==2?"spacious":"comfortable";apply_appearance(br);}),b);
+    settings_section("UI text size", "Scale labels and controls in the browser interface.", appearance);
+    GtkWidget *font_scale=gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,80,140,5); gtk_range_set_value(GTK_RANGE(font_scale),b->ui_font_size); gtk_scale_set_draw_value(GTK_SCALE(font_scale),TRUE); gtk_widget_set_size_request(font_scale,300,-1); gtk_widget_set_halign(font_scale,GTK_ALIGN_START); gtk_box_append(GTK_BOX(appearance),font_scale);
+    g_signal_connect(font_scale,"value-changed",G_CALLBACK(+[](GtkRange*r,gpointer d){Browser*br=static_cast<Browser*>(d);br->ui_font_size=static_cast<int>(gtk_range_get_value(r));apply_appearance(br);}),b);
+    settings_section("Tab placement", "Choose where your tabs appear.", appearance);
+    const char *tab_options[] = {"Left","Top","Right","Bottom",nullptr}; GtkWidget *tabs=gtk_drop_down_new_from_strings(tab_options); gtk_drop_down_set_selected(GTK_DROP_DOWN(tabs),b->tab_position=="top"?1:b->tab_position=="right"?2:b->tab_position=="bottom"?3:0); gtk_widget_set_halign(tabs,GTK_ALIGN_START); gtk_widget_set_size_request(tabs,240,-1); gtk_box_append(GTK_BOX(appearance),tabs);
+    g_signal_connect(tabs,"notify::selected",G_CALLBACK(+[](GObject*o,GParamSpec*,gpointer d){Browser*br=static_cast<Browser*>(d);guint v=gtk_drop_down_get_selected(GTK_DROP_DOWN(o));br->tab_position=v==1?"top":v==2?"right":v==3?"bottom":"left";apply_appearance(br);}),b);
+    GtkWidget *exts = page("Extensions");
+    GtkWidget *et = gtk_label_new("Installed extensions"); gtk_widget_add_css_class(et,"title-2"); gtk_widget_set_halign(et,GTK_ALIGN_START); gtk_box_append(GTK_BOX(exts),et);
+    GtkWidget *scroll=gtk_scrolled_window_new(); gtk_widget_set_vexpand(scroll,TRUE); gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scroll),170); GtkWidget *text=gtk_text_view_new(); gtk_text_view_set_editable(GTK_TEXT_VIEW(text),FALSE); gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(text),FALSE); gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(text),GTK_WRAP_WORD_CHAR); std::string list=b->ext?b->ext->describe():"Extension manager unavailable."; gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(text)),list.c_str(),-1); gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),text); gtk_box_append(GTK_BOX(exts),scroll);
+    GtkWidget *il=gtk_label_new("Install from Firefox Add-ons or a local package"); gtk_widget_set_halign(il,GTK_ALIGN_START); gtk_box_append(GTK_BOX(exts),il); GtkWidget *ir=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8); GtkWidget *ie=gtk_entry_new(); gtk_widget_set_hexpand(ie,TRUE); gtk_entry_set_placeholder_text(GTK_ENTRY(ie),"AMO URL or local .xpi/.zip path"); GtkWidget *ib=gtk_button_new_with_label("Install"); auto *ia=new ExtAction{b,ie}; g_signal_connect_data(ib,"clicked",G_CALLBACK(install_extension_clicked),ia,+[](gpointer p,GClosure*){delete static_cast<ExtAction*>(p);},GConnectFlags(0)); gtk_box_append(GTK_BOX(ir),ie);gtk_box_append(GTK_BOX(ir),ib);gtk_box_append(GTK_BOX(exts),ir);
+    GtkWidget *rr=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8); GtkWidget *re=gtk_entry_new(); gtk_widget_set_hexpand(re,TRUE); gtk_entry_set_placeholder_text(GTK_ENTRY(re),"Extension name or ID to remove"); GtkWidget *rb=gtk_button_new_with_label("Remove"); auto *ra=new ExtAction{b,re};g_signal_connect_data(rb,"clicked",G_CALLBACK(remove_extension_clicked),ra,+[](gpointer p,GClosure*){delete static_cast<ExtAction*>(p);},GConnectFlags(0));gtk_box_append(GTK_BOX(rr),re);gtk_box_append(GTK_BOX(rr),rb);gtk_box_append(GTK_BOX(exts),rr);
+    GtkWidget *warning=gtk_label_new("Installed extensions load after restarting. Firefox API compatibility is still evolving.");gtk_label_set_wrap(GTK_LABEL(warning),TRUE);gtk_widget_add_css_class(warning,"dim-label");gtk_widget_set_halign(warning,GTK_ALIGN_START);gtk_box_append(GTK_BOX(exts),warning);
+    GtkWidget *privacy=page("Privacy"); settings_section("Privacy & security", "Privacy controls will be expanded as the underlying WebKit controls are wired up.",privacy);
+    GtkWidget *about=page("About"); GtkWidget *abt=gtk_label_new("ReedBrowser");gtk_widget_add_css_class(abt,"title-1");gtk_widget_set_halign(abt,GTK_ALIGN_START);gtk_box_append(GTK_BOX(about),abt);GtkWidget *desc=gtk_label_new("A native GTK4 + WebKitGTK browser.");gtk_widget_set_halign(desc,GTK_ALIGN_START);gtk_box_append(GTK_BOX(about),desc);
+    // Settings search filters navigation pages by their visible page names.
+    g_signal_connect(search,"search-changed",G_CALLBACK(+[](GtkSearchEntry *entry,gpointer d){GtkNotebook *nb=GTK_NOTEBOOK(d);const char*q=gtk_editable_get_text(GTK_EDITABLE(entry));std::string query=q?q:"";std::transform(query.begin(),query.end(),query.begin(),[](unsigned char c){return std::tolower(c);});if(query.empty())return;for(int i=0;i<gtk_notebook_get_n_pages(nb);++i){GtkWidget *tab=gtk_notebook_get_tab_label(nb,gtk_notebook_get_nth_page(nb,i));const char*t=GTK_IS_LABEL(tab)?gtk_label_get_text(GTK_LABEL(tab)):"";std::string name=t?t:"";std::transform(name.begin(),name.end(),name.begin(),[](unsigned char c){return std::tolower(c);});if(name.find(query)!=std::string::npos){gtk_notebook_set_current_page(nb,i);break;}}}),pages);
+    gtk_window_set_child(GTK_WINDOW(win),root); gtk_window_present(GTK_WINDOW(win));
+}
+static void on_menu_action(GtkButton *button, gpointer data) {
+    Browser *b = static_cast<Browser *>(data); int action = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "action"));
+    if (action == 0) create_tab(b, false, "", false);
+    else if (action == 1) { create_tab(b, true, "", false); set_status(b, "Private tab: history and site data are not saved."); }
+    else if (action == 2) show_settings(b);
+    else if (action == 3) set_theme(b, "dark");
+    else set_theme(b, "system");
+    GtkWidget *p = gtk_widget_get_parent(GTK_WIDGET(button)); if (p) p = gtk_widget_get_parent(p); if (p && GTK_IS_POPOVER(p)) gtk_popover_popdown(GTK_POPOVER(p));
+}
+
 static GtkWidget *icon_button(const char *icon, const char *tooltip, GCallback callback, Browser *b) {
     GtkWidget *button = gtk_button_new_from_icon_name(icon);
     gtk_widget_set_tooltip_text(button, tooltip);
@@ -659,7 +846,9 @@ static void activate(GtkApplication *app, gpointer data) {
     Browser *b = static_cast<Browser *>(data);
     if (b->window) { gtk_window_present(GTK_WINDOW(b->window)); return; }
 
+    load_theme(b);
     apply_css();
+    apply_appearance(b);
     if (b->ext) b->ext->start();
     b->window = gtk_application_window_new(app);
     g_signal_connect(b->window, "close-request", G_CALLBACK(on_close_request), b);
@@ -696,6 +885,14 @@ static void activate(GtkApplication *app, gpointer data) {
     gtk_box_append(GTK_BOX(b->toolbar), b->address);
     gtk_box_append(GTK_BOX(b->toolbar), bookmark);
     gtk_box_append(GTK_BOX(b->toolbar), newtab);
+    GtkWidget *menu_button = gtk_menu_button_new();
+    gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(menu_button), "open-menu-symbolic");
+    gtk_widget_set_tooltip_text(menu_button, "ReedBrowser menu");
+    GtkWidget *popover = gtk_popover_new(); GtkWidget *menu_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+    gtk_widget_set_margin_start(menu_box, 8); gtk_widget_set_margin_end(menu_box, 8); gtk_widget_set_margin_top(menu_box, 8); gtk_widget_set_margin_bottom(menu_box, 8);
+    const char *menu_labels[] = {"New tab", "New private tab", "Settings & extensions", "Dark mode", "System theme"};
+    for (int i=0;i<5;i++) { GtkWidget *item=gtk_button_new_with_label(menu_labels[i]); gtk_widget_add_css_class(item,"flat"); g_object_set_data(G_OBJECT(item),"action",GINT_TO_POINTER(i)); g_signal_connect(item,"clicked",G_CALLBACK(on_menu_action),b); gtk_box_append(GTK_BOX(menu_box),item); }
+    gtk_popover_set_child(GTK_POPOVER(popover),menu_box); gtk_menu_button_set_popover(GTK_MENU_BUTTON(menu_button),popover); gtk_box_append(GTK_BOX(b->toolbar),menu_button);
     g_signal_connect(b->address, "activate", G_CALLBACK(on_address_activate), b);
 
     b->progress = gtk_progress_bar_new();
@@ -791,7 +988,7 @@ static void shutdown_app(GApplication *, gpointer data) {
 }
 
 static void apply_css() {
-    const char *css = R"CSS(.toolbar{background:alpha(@theme_bg_color,.94);border-bottom:1px solid alpha(@theme_fg_color,.10);}.address-entry{border-radius:10px;min-height:34px;padding-left:12px;padding-right:12px;}.notebook tab{padding:5px 8px;}.notebook tab label{font-size:0.92em;})CSS";
+    const char *css = R"CSS(.toolbar{background:alpha(@theme_bg_color,.94);border-bottom:1px solid alpha(@theme_fg_color,.10);}.address-entry{border-radius:10px;min-height:34px;padding-left:12px;padding-right:12px;}.notebook tab{padding:5px 8px;}.notebook tab label{font-size:0.92em;}.toolbar.compact-ui{padding-top:0;padding-bottom:0;}.toolbar.spacious-ui{padding-top:8px;padding-bottom:8px;})CSS";
     GtkCssProvider *provider = gtk_css_provider_new();
 #if GTK_CHECK_VERSION(4, 12, 0)
     gtk_css_provider_load_from_string(provider, css);
@@ -810,7 +1007,7 @@ int main(int argc, char **argv) {
         if (arg == "--version" || arg == "-V") { printf("ReedBrowser %s\n", REEDBROWSER_VERSION); return 0; }
         if (arg == "--help" || arg == "-h") {
             puts("Usage: reedbrowser [URL...]\n"
-                 "       reedbrowser --install-extension <file.xpi|.zip|folder> [--yes]\n"
+                 "       reedbrowser --install-extension <AMO-URL|amo:slug|file.xpi|.zip|folder> [--yes]\n"
                  "       reedbrowser --list-extensions\n"
                  "       reedbrowser --remove-extension <id-or-name>\n"
                  "       reedbrowser --version");

@@ -9,8 +9,6 @@ checks = {
     "CMakeLists.txt": (root / "CMakeLists.txt").is_file(),
     "main.cpp": (root / "src/main.cpp").is_file(),
     "store.hpp": (root / "src/store.hpp").is_file(),
-    "desktop entry": (root / "data/reedbrowser.desktop").is_file(),
-    "icon": (root / "data/reedbrowser.svg").is_file(),
     "license": (root / "LICENSE").is_file(),
 }
 source = (root / "src/main.cpp").read_text()

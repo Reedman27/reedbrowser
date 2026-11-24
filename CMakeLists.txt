@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 cmake_minimum_required(VERSION 3.20)
-project(ReedBrowser VERSION 0.5.1 LANGUAGES CXX)
+project(ReedBrowser VERSION 0.5.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,6 +16,7 @@ pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
 pkg_check_modules(WEBKIT REQUIRED IMPORTED_TARGET webkitgtk-6.0)
 pkg_check_modules(JSONGLIB REQUIRED IMPORTED_TARGET json-glib-1.0)
 pkg_check_modules(LIBARCHIVE REQUIRED IMPORTED_TARGET libarchive)
+pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
 
 # Embed the in-page browser.* implementation as a C++ raw string.
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/ext/api.js REED_API_JS)
@@ -25,11 +26,9 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_S
 
 add_executable(reedbrowser src/main.cpp src/extensions.cpp)
 target_include_directories(reedbrowser PRIVATE src ${CMAKE_CURRENT_BINARY_DIR}/gen)
-target_link_libraries(reedbrowser PRIVATE PkgConfig::GTK4 PkgConfig::WEBKIT PkgConfig::JSONGLIB PkgConfig::LIBARCHIVE SQLite::SQLite3)
+target_link_libraries(reedbrowser PRIVATE PkgConfig::GTK4 PkgConfig::WEBKIT PkgConfig::JSONGLIB PkgConfig::LIBARCHIVE PkgConfig::CURL SQLite::SQLite3)
 target_compile_options(reedbrowser PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 target_compile_definitions(reedbrowser PRIVATE REEDBROWSER_VERSION="${PROJECT_VERSION}" REEDBROWSER_EXT_VERSION="${PROJECT_VERSION}")
 
 install(TARGETS reedbrowser RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(FILES data/reedbrowser.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
-install(FILES data/reedbrowser.svg DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)
 install(FILES README.md LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/reedbrowser)

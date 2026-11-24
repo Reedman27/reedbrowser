@@ -5,6 +5,7 @@
 #include <archive.h>
 #include <archive_entry.h>
 #include <json-glib/json-glib.h>
+#include <curl/curl.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <iostream>
 #include <set>
 #include <sstream>
+#include <cctype>
 
 #include "ext/api_js.h"
 
@@ -344,6 +346,127 @@ std::string ExtensionManager::describe() const {
 
 // -------------------------------------------------------------------- install
 
+// -------------------------------------------------------------------- AMO download support
+
+static size_t curl_to_string(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    auto *out = static_cast<std::string *>(userdata);
+    out->append(ptr, size * nmemb);
+    return size * nmemb;
+}
+static size_t curl_to_file(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    return std::fwrite(ptr, size, nmemb, static_cast<FILE *>(userdata));
+}
+
+static bool is_https_url(const std::string &url) {
+    return url.rfind("https://", 0) == 0;
+}
+
+static bool download_amo_xpi(const std::string &input, const std::string &destination, std::string *err) {
+    // Accept an AMO add-on page or a direct AMO API add-on slug. Do not accept
+    // arbitrary remote URLs here: the API response is constrained to HTTPS.
+    std::string slug;
+    const std::string marker = "/firefox/addon/";
+    auto pos = input.find(marker);
+    if (pos != std::string::npos) {
+        std::string tail = input.substr(pos + marker.size());
+        auto end = tail.find_first_of("/?#");
+        slug = tail.substr(0, end);
+    } else if (input.rfind("amo:", 0) == 0) {
+        slug = input.substr(4);
+    }
+    while (!slug.empty() && slug.back() == '/') slug.pop_back();
+    if (slug.empty() || slug.size() > 200 || !std::all_of(slug.begin(), slug.end(), [](unsigned char c) {
+            return std::isalnum(c) || c == '-' || c == '_';
+        })) {
+        *err = "Expected a Firefox Add-ons page URL, e.g. https://addons.mozilla.org/firefox/addon/ublock-origin/, or amo:<slug>.";
+        return false;
+    }
+
+    static const CURLcode curl_init_status = curl_global_init(CURL_GLOBAL_DEFAULT);
+    if (curl_init_status != CURLE_OK) { *err = "Could not initialize HTTPS support."; return false; }
+    CURL *curl = curl_easy_init();
+    if (!curl) { *err = "Could not initialize HTTPS downloader."; return false; }
+    std::string api = "https://addons.mozilla.org/api/v5/addons/addon/" + slug + "/";
+    std::string body;
+    curl_easy_setopt(curl, CURLOPT_URL, api.c_str());
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ReedBrowser/0.5.2 (Firefox Add-ons installer)");
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 90L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_to_string);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    CURLcode rc = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_cleanup(curl);
+    if (rc != CURLE_OK || status < 200 || status >= 300) {
+        *err = "Could not retrieve add-on from Firefox Add-ons (" + std::string(curl_easy_strerror(rc)) + ", HTTP " + std::to_string(status) + ").";
+        return false;
+    }
+
+    Json api_json = parse(body);
+    JsonObject *root = api_json.obj();
+    JsonNode *version_node = member(root, "current_version");
+    JsonObject *version = version_node && JSON_NODE_HOLDS_OBJECT(version_node) ? json_node_get_object(version_node) : nullptr;
+
+    // AMO's v5 detail response exposes the downloadable package as
+    // current_version.file.url. Older/alternate responses may expose a
+    // files[] collection, so accept both shapes without trusting arbitrary
+    // URLs from the add-on page itself.
+    std::string xpi_url;
+    JsonNode *file_node = member(version, "file");
+    JsonObject *file_obj = file_node && JSON_NODE_HOLDS_OBJECT(file_node) ? json_node_get_object(file_node) : nullptr;
+    std::string current_file_url = str_of(file_obj, "url");
+    if (is_https_url(current_file_url)) xpi_url = current_file_url;
+
+    if (xpi_url.empty()) {
+        JsonNode *files_node = member(version, "files");
+        JsonArray *files = files_node && JSON_NODE_HOLDS_ARRAY(files_node) ? json_node_get_array(files_node) : nullptr;
+        if (files) {
+            for (guint i = 0; i < json_array_get_length(files); ++i) {
+                JsonNode *candidate = json_array_get_element(files, i);
+                JsonObject *candidate_obj = candidate && JSON_NODE_HOLDS_OBJECT(candidate) ? json_node_get_object(candidate) : nullptr;
+                std::string candidate_url = str_of(candidate_obj, "url");
+                if (is_https_url(candidate_url)) { xpi_url = candidate_url; break; }
+            }
+        }
+    }
+    if (!is_https_url(xpi_url)) {
+        *err = "Firefox Add-ons did not return a valid HTTPS XPI download for '" + slug + "'.";
+        return false;
+    }
+
+    FILE *out = std::fopen(destination.c_str(), "wb");
+    if (!out) { *err = "Could not create temporary XPI file."; return false; }
+    curl = curl_easy_init();
+    if (!curl) { std::fclose(out); *err = "Could not initialize XPI downloader."; return false; }
+    curl_easy_setopt(curl, CURLOPT_URL, xpi_url.c_str());
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ReedBrowser/0.5.2 (Firefox Add-ons installer)");
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_to_file);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, out);
+    rc = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_cleanup(curl);
+    bool file_ok = std::fclose(out) == 0;
+    if (rc != CURLE_OK || status < 200 || status >= 300 || !file_ok || fs::file_size(destination) < 128) {
+        std::error_code ec; fs::remove(destination, ec);
+        *err = "XPI download failed (" + std::string(curl_easy_strerror(rc)) + ", HTTP " + std::to_string(status) + ").";
+        return false;
+    }
+    return true;
+}
+
 static bool extract_archive(const std::string &file, const std::string &dest, std::string *err) {
     struct archive *a = archive_read_new();
     archive_read_support_format_zip(a);
@@ -372,6 +495,13 @@ static bool extract_archive(const std::string &file, const std::string &dest, st
 
 bool ExtensionManager::install(const std::string &path, bool assume_yes, std::string *message) {
     std::error_code ec;
+    if (path.rfind("https://addons.mozilla.org/", 0) == 0 || path.rfind("amo:", 0) == 0) {
+        std::string temp = d_->data_dir + "/amo-download-" + std::to_string(getpid()) + ".xpi";
+        std::string download_error;
+        if (!download_amo_xpi(path, temp, &download_error)) { *message = download_error; return false; }
+        struct RemoveTemp { std::string p; ~RemoveTemp() { std::error_code e; fs::remove(p, e); } } cleanup_download{temp};
+        return install(temp, assume_yes, message);
+    }
     if (!fs::exists(path)) { *message = "No such file or directory: " + path; return false; }
     std::string staging = d_->ext_dir + "/.staging-" + std::to_string(getpid());
     fs::remove_all(staging, ec);

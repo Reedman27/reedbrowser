@@ -1,4 +1,4 @@
-# ReedBrowser 0.5.1 — Fedora 45 development build (WebExtensions preview)
+# ReedBrowser 0.5.2 — Fedora 45 development build (AMO XPI installer preview)
 
 ReedBrowser is a small, independent Linux browser built on **GTK 4 + WebKitGTK 6.0**. This release replaces the earlier FLTK/offscreen-framebuffer architecture with native WebKit widgets.
 
@@ -12,9 +12,12 @@ The 0.4.0 design embeds `WebKitWebView` widgets directly in GTK4. This removes t
 
 ## Firefox extensions (preview)
 
-ReedBrowser has its own WebExtensions runtime on top of WebKitGTK (the approach Orion takes). Install from the command line:
+ReedBrowser 0.5.2 can resolve an add-on listing from the official Firefox Add-ons website (AMO), download its XPI over HTTPS, and pass it through ReedBrowser’s existing manifest and permission installer. This is package installation support, **not full Firefox WebExtensions compatibility**. The runtime remains WebKitGTK-based; uBlock Origin and Proton Pass still require additional API and UI work.
 
-    reedbrowser --install-extension ublock.xpi      # .xpi/.zip or an unpacked folder; asks for consent (add --yes to skip)
+ReedBrowser has its own WebExtensions runtime on top of WebKitGTK (the approach Orion takes). Install directly from a Firefox Add-ons (AMO) listing URL, or use a local XPI/ZIP/folder:
+
+    reedbrowser --install-extension https://addons.mozilla.org/firefox/addon/ublock-origin/  # install directly from AMO
+    reedbrowser --install-extension /path/to/addon.xpi  # or install a local XPI/ZIP/folder
     reedbrowser --list-extensions
     reedbrowser --remove-extension <id-or-name>
 
@@ -41,7 +44,7 @@ Working today: `moz-extension://` pages, background scripts/pages, content scrip
 Install dependencies:
 
 ```bash
-sudo dnf install gcc-c++ cmake make pkgconf-pkg-config gtk4-devel webkitgtk6.0-devel sqlite-devel
+sudo dnf install gcc-c++ cmake make pkgconf-pkg-config gtk4-devel webkitgtk6.0-devel sqlite-devel json-glib-devel libarchive-devel libcurl-devel
 ```
 
 Build:
@@ -115,3 +118,8 @@ The uploaded Epiphany source was inspected as an architectural reference, especi
 ## License
 
 GNU Affero General Public License version 3 only (`AGPL-3.0-only`). See `LICENSE`.
+
+## Settings and appearance
+
+Open the application menu at the right end of the navigation toolbar and select **Settings & extensions**. The settings window includes an Appearance page with a persistent dark-mode toggle, an Extensions page for viewing/installing/removing extensions, and an About page. See [Settings UI](docs/SETTINGS-UI.md) for current behavior and limitations.
+

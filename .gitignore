@@ -1,0 +1,7 @@
+/build/
+*.o
+*.a
+*.so
+*.rpm
+*.tar.gz
+TODO.local.md
