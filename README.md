@@ -1,27 +1,37 @@
-# ReedBrowser 0.5.2 — Fedora 45 development build (AMO XPI installer preview)
+<h1 align="center">ReedBrowser</h1>
+<p align="center"><b>A small, quiet Linux browser built on GTK 4 and WebKitGTK 6.0.</b><br>
+Vertical tabs, a dark UI, Firefox add-on support, and a footprint that suits modest hardware.</p>
 
-ReedBrowser is a small, independent Linux browser built on **GTK 4 + WebKitGTK 6.0**. This release replaces the earlier FLTK/offscreen-framebuffer architecture with native WebKit widgets.
+<p align="center"><img src="docs/screenshots/home.png" alt="ReedBrowser new-tab page in dark mode" width="900"></p>
 
-The target is a responsive browser for modest systems, including laptops with about 5 GB of usable RAM. The browser UI does not create a separate application process for each tab. Normal tabs share one persistent `WebKitNetworkSession`; WebKit controls its own network and web-content processes, including process swaps and site isolation. Private tabs use ephemeral sessions.
+<table>
+<tr>
+<td width="50%"><img src="docs/screenshots/page.png" alt="Browsing with vertical tabs and the bookmarks bar"><br><sub>Vertical tabs, bookmarks bar, starred page</sub></td>
+<td width="50%"><img src="docs/screenshots/manager.png" alt="Bookmark manager"><br><sub>Bookmark manager with search, edit and import</sub></td>
+</tr>
+</table>
 
-## Why this architecture
+## Highlights
 
-The previous 0.3.x design rendered each tab into an offscreen GTK window and copied frames through shared memory to FLTK. That forced software-style frame capture, complicated input forwarding, and was a poor fit for video, WebGL, and modern compositing.
+- **Native and light.** One WebKit view per tab inside a GTK4 window. Normal tabs share a persistent session, and private tabs use an ephemeral one. WebKit decides how renderer processes are shared.
+- **Dark by design.** A custom dark theme covers the toolbar, tabs, menus, dialogs and the new-tab page. Light and system themes, accent colours and UI density are in Settings.
+- **Bookmarks that behave.** Star a page with Ctrl+D, show a bookmarks bar with Ctrl+Shift+B, and edit, remove, search and organise in the manager (Ctrl+Shift+O). Import from Firefox, Chrome, Chromium or Brave, or from an exported HTML file.
+- **Firefox add-ons.** Install from addons.mozilla.org with the *Add to Firefox* button, or from the command line. See [docs/EXTENSIONS.md](docs/EXTENSIONS.md) for exactly what is supported.
+- **Everyday tools.** History (Ctrl+H), downloads (Ctrl+J), find in page, zoom, print, view source, full screen, reopen closed tab, and session restore.
+- **Privacy defaults.** Intelligent Tracking Prevention, a built-in tracker list, a local-only new-tab page, and site permission requests denied by default.
 
-The 0.4.0 design embeds `WebKitWebView` widgets directly in GTK4. This removes the frame-copy bridge and lets WebKit use its normal rendering/compositing path. It also follows the useful architecture seen in Epiphany: one WebKit view per tab, shared normal browsing session, and ephemeral private sessions. WebKit—not ReedBrowser—decides when renderer processes are shared or replaced.
+## Firefox extensions
 
-## Firefox extensions (preview)
+ReedBrowser has its own WebExtensions runtime on top of WebKitGTK. Install from an add-on page on addons.mozilla.org, or from the command line:
 
-ReedBrowser 0.5.2 can resolve an add-on listing from the official Firefox Add-ons website (AMO), download its XPI over HTTPS, and pass it through ReedBrowser’s existing manifest and permission installer. This is package installation support, **not full Firefox WebExtensions compatibility**. The runtime remains WebKitGTK-based; uBlock Origin and Proton Pass still require additional API and UI work.
-
-ReedBrowser has its own WebExtensions runtime on top of WebKitGTK (the approach Orion takes). Install directly from a Firefox Add-ons (AMO) listing URL, or use a local XPI/ZIP/folder:
-
-    reedbrowser --install-extension https://addons.mozilla.org/firefox/addon/ublock-origin/  # install directly from AMO
-    reedbrowser --install-extension /path/to/addon.xpi  # or install a local XPI/ZIP/folder
+    reedbrowser --install-extension https://addons.mozilla.org/firefox/addon/ublock-origin-lite/
+    reedbrowser --install-extension /path/to/addon.xpi
     reedbrowser --list-extensions
     reedbrowser --remove-extension <id-or-name>
 
-Working today: `moz-extension://` pages, background scripts/pages, content scripts + CSS (isolated JS world, match patterns), `runtime.sendMessage`/`onMessage`, `storage.local/sync/session`, `tabs.*` basics, `tabs.sendMessage`, `i18n`, `alarms`. **Not yet: `webRequest` blocking (what uBlock Origin MV2 needs), ports, popups/options pages, toolbar buttons.** uBlock Origin and Proton Pass are NOT confirmed working. See docs/EXTENSIONS.md.
+Working today: background pages and scripts, content scripts and CSS, popups, options pages and toolbar buttons, `runtime` messaging and ports, `storage`, `tabs`, `scripting`, `declarativeNetRequest` (static and dynamic rules), `cookies`, `webNavigation`, observe-only `webRequest`, `i18n` and `alarms`.
+
+Not supported: blocking `webRequest` (so uBlock Origin's older Manifest V2 build cannot block; use **uBlock Origin Lite**), native messaging, extension context menus and keyboard commands, and per-permission prompts. Nothing here is guaranteed to work with every add-on; Proton Pass in particular is untested. Details are in [docs/EXTENSIONS.md](docs/EXTENSIONS.md).
 
 ## Implemented in this source build
 

@@ -178,15 +178,27 @@ static Tab *active_tab(Browser *b) {
     return nullptr;
 }
 
+static std::string link_inner(const std::string &title, const std::string &uri) {
+    std::string t = title.empty() ? uri : title;
+    std::string host = uri;
+    size_t p = host.find("://"); if (p != std::string::npos) host = host.substr(p + 3);
+    if (host.rfind("www.", 0) == 0) host = host.substr(4);
+    host = host.substr(0, host.find('/'));
+    unsigned h = 0; for (unsigned char c : host) h = h * 31 + c;
+    std::string letter = "?";
+    for (unsigned char c : host.empty() ? t : host) if (std::isalnum(c)) { letter = std::string(1, (char)std::toupper(c)); break; }
+    return "<i style=\"--h:" + std::to_string(h % 360) + "\">" + letter + "</i><span>" + html_escape(t) + "</span>";
+}
+
 static std::string homepage_html(Browser *b, bool private_mode) {
     std::string html = R"HTML(<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>New Tab</title><style>
-:root{color-scheme:light dark}*{box-sizing:border-box}body{margin:0;background:#f5f6f8;color:#20242b;font:15px system-ui,-apple-system,sans-serif}.wrap{max-width:760px;margin:12vh auto 0;padding:28px}.brand{font-size:34px;font-weight:650;letter-spacing:-1.4px;margin-bottom:8px}.sub{color:#747b86;margin-bottom:28px}.search{display:flex;background:white;border:1px solid #dce0e6;border-radius:12px;padding:14px 17px;box-shadow:0 4px 18px #1720330b}.search input{border:0;outline:0;background:transparent;color:inherit;width:100%;font:inherit}.section{margin-top:34px}.heading{font-size:12px;font-weight:700;letter-spacing:.09em;color:#747b86;margin-bottom:12px}.links{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:9px}.link{display:block;padding:12px 14px;border:1px solid #e0e3e8;border-radius:10px;background:#fff;color:inherit;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.link:hover{border-color:#8b9bb6;background:#fafbfc}.muted{color:#858c96;font-size:13px}@media(prefers-color-scheme:dark){body{background:#17191e;color:#e7e9ed}.search,.link{background:#22252c;border-color:#343943}.link:hover{background:#292d35;border-color:#68758a}.sub,.heading,.muted{color:#9ba3b0}}</style></head><body><main class="wrap"><div class="brand">ReedBrowser</div><div class="sub">A quieter place to browse.</div><form class="search" action="https://duckduckgo.com/" method="get"><input name="q" autofocus placeholder="Search the web or enter an address" aria-label="Search"></form>)HTML";
-    html += "<style>:root{--reed-accent:" + b->accent + ";} .brand{color:var(--reed-accent)}.search:focus-within{border-color:var(--reed-accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--reed-accent) 22%,transparent)}.link:hover{border-color:var(--reed-accent)!important}</style>";
-    if (b->theme == "dark") html += "<style>:root{color-scheme:dark}body{background:#17191e!important;color:#e7e9ed!important}.search,.link{background:#22252c!important;border-color:#343943!important;color:#e7e9ed!important}.sub,.heading,.muted{color:#9ba3b0!important}</style>";
-    else if (b->theme == "light") html += "<style>:root{color-scheme:light}body{background:#f5f6f8!important;color:#20242b!important}.search,.link{background:white!important;color:#20242b!important}</style>";
+:root{color-scheme:light dark;--accent:#6ea8fe}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(1100px 520px at 50% -8%,#e9eefb 0%,#f5f6f8 60%);color:#20242b;font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:820px;margin:0 auto;padding:11vh 28px 60px}.logo{display:flex;align-items:center;gap:14px;margin-bottom:6px}.mark{width:46px;height:46px;border-radius:14px;background:linear-gradient(135deg,var(--reed-accent),#7c5cff);display:grid;place-items:center;color:#fff;font-weight:700;font-size:25px;box-shadow:0 8px 24px color-mix(in srgb,var(--reed-accent) 35%,transparent)}.brand{font-size:36px;font-weight:700;letter-spacing:-1.2px;margin:0}.sub{color:#747b86;margin:0 0 30px 60px;margin-top:-2px}.search{display:flex;background:#fff;border:1px solid #dce0e6;border-radius:999px;padding:15px 22px;box-shadow:0 6px 26px #1720331a;transition:border-color .15s,box-shadow .15s}.search input{border:0;outline:0;background:transparent;color:inherit;width:100%;font:inherit;font-size:16px}.section{margin-top:38px}.heading{font-size:11.5px;font-weight:700;letter-spacing:.12em;color:#747b86;margin-bottom:14px;display:flex;align-items:center}.links{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}.link{display:flex;align-items:center;gap:11px;padding:11px 14px;border:1px solid #e0e3e8;border-radius:14px;background:#fff;color:inherit;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:transform .12s,border-color .12s,background .12s}.link:hover{border-color:#8b9bb6;background:#fafbfc;transform:translateY(-1px)}.link i{flex:none;width:28px;height:28px;border-radius:9px;display:grid;place-items:center;font-style:normal;font-weight:700;font-size:13px;color:#fff;background:hsl(var(--h,220) 55% 48%)}.link span{overflow:hidden;text-overflow:ellipsis}.muted{color:#858c96;font-size:13px}@media(prefers-color-scheme:dark){body{background:radial-gradient(1100px 520px at 50% -8%,#1d2230 0%,#14161b 62%);color:#e7e9ed}.search,.link{background:#1c1f26;border-color:#2d323d}.link:hover{background:#242832;border-color:#4a5262}.sub,.heading,.muted{color:#8f98a6}}</style></head><body><main class="wrap"><div class="logo"><div class="mark">R</div><h1 class="brand">ReedBrowser</h1></div><div class="sub">A quieter place to browse.</div><form class="search" action="https://duckduckgo.com/" method="get"><input name="q" autofocus placeholder="Search the web or enter an address" aria-label="Search"></form>)HTML";
+    html += "<style>:root{--reed-accent:" + b->accent + ";} .search:focus-within{border-color:var(--reed-accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--reed-accent) 22%,transparent)}.link:hover{border-color:var(--reed-accent)!important}</style>";
+    if (b->theme == "dark") html += "<style>:root{color-scheme:dark}body{background:radial-gradient(1100px 520px at 50% -8%,#1d2230 0%,#14161b 62%)!important;color:#e7e9ed!important}.search,.link{background:#1c1f26!important;border-color:#2d323d!important;color:#e7e9ed!important}.link:hover{background:#242832!important}.sub,.heading,.muted{color:#9ba3b0!important}</style>";
+    else if (b->theme == "light") html += "<style>:root{color-scheme:light}body{color:#20242b!important}.search,.link{background:white!important;color:#20242b!important}</style>";
     {
         const std::string t = "?t=" + b->home_token;
-        html += "<style>.tile{display:inline-flex;align-items:center;gap:2px;margin:0 8px 8px 0}.tile .link{margin:0}"
+        html += "<style>.tile{display:flex;align-items:center;gap:2px;min-width:0}.tile .link{flex:1;min-width:0}"
                 ".tile .act{font-size:12px;text-decoration:none;color:inherit;opacity:.35;padding:4px 5px;border-radius:6px}"
                 ".tile:hover .act{opacity:.9}.tile .act:hover{background:rgba(127,127,127,.25)}.tile .rm:hover{color:#e5484d}"
                 ".folder{margin:14px 0 8px;font-size:12px;opacity:.7}.hl{font-size:12px;margin-left:12px;text-decoration:none;color:var(--reed-accent)}</style>";
@@ -204,7 +216,7 @@ static std::string homepage_html(Browser *b, bool private_mode) {
                 html += "<div class=\"links\">"; open = true;
             }
             std::string id = std::to_string(row.id);
-            html += "<span class=\"tile\"><a class=\"link\" href=\"" + html_escape(row.uri) + "\">" + html_escape(row.title.empty() ? row.uri : row.title) + "</a>"
+            html += "<span class=\"tile\"><a class=\"link\" href=\"" + html_escape(row.uri) + "\">" + link_inner(row.title, row.uri) + "</a>"
                     "<a class=\"act\" title=\"Edit bookmark\" href=\"reed://edit/" + id + t + "\">&#9998;</a>"
                     "<a class=\"act rm\" title=\"Remove bookmark\" href=\"reed://remove/" + id + t + "\">&#10005;</a></span>";
         }
@@ -216,7 +228,7 @@ static std::string homepage_html(Browser *b, bool private_mode) {
         auto recent = b->store.recent_unique(8);
         if (recent.empty()) html += "<span class=\"muted\">No browsing history yet.</span>";
         for (const auto &row : recent)
-            html += "<a class=\"link\" href=\"" + html_escape(row.uri) + "\">" + html_escape(row.title.empty() ? row.uri : row.title) + "</a>";
+            html += "<a class=\"link\" href=\"" + html_escape(row.uri) + "\">" + link_inner(row.title, row.uri) + "</a>";
         html += "</div></section>";
     }
     html += "</main></body></html>";
@@ -736,6 +748,7 @@ static bool valid_hex_color(const std::string &v) {
     if (v.size() != 7 || v[0] != '#') return false;
     return std::all_of(v.begin() + 1, v.end(), [](unsigned char c){ return std::isxdigit(c) != 0; });
 }
+static void apply_css(bool dark);
 static void apply_custom_css(Browser *b) {
     if (!gdk_display_get_default()) return;
     char *css = g_strdup_printf(
@@ -751,6 +764,7 @@ static void apply_custom_css(Browser *b) {
 }
 static void set_theme(Browser *b, const std::string &theme) {
     b->theme = theme == "dark" || theme == "light" ? theme : "system";
+    apply_css(b->theme == "dark");
     GtkSettings *settings = gtk_settings_get_default();
     if (settings && g_object_class_find_property(G_OBJECT_GET_CLASS(settings), "gtk-application-prefer-dark-theme"))
         g_object_set(settings, "gtk-application-prefer-dark-theme", b->theme == "dark", nullptr);
@@ -780,6 +794,7 @@ static void load_theme(Browser *b) {
         g_object_set(settings, "gtk-application-prefer-dark-theme", b->theme == "dark", nullptr);
 }
 static void apply_appearance(Browser *b) {
+    apply_css(b->theme == "dark");
     apply_custom_css(b);
     if (b->notebook) {
         GtkPositionType pos = b->tab_position == "top" ? GTK_POS_TOP : b->tab_position == "bottom" ? GTK_POS_BOTTOM : b->tab_position == "right" ? GTK_POS_RIGHT : GTK_POS_LEFT;
@@ -1669,14 +1684,13 @@ static GtkWidget *icon_button(const char *icon, const char *tooltip, GCallback c
 
 static void on_switch_page(GtkNotebook *, GtkWidget *, guint, gpointer data);
 static gboolean on_close_request(GtkWindow *, gpointer data);
-static void apply_css();
+static void apply_css(bool dark);
 
 static void activate(GtkApplication *app, gpointer data) {
     Browser *b = static_cast<Browser *>(data);
     if (b->window) { gtk_window_present(GTK_WINDOW(b->window)); return; }
 
     load_theme(b);
-    apply_css();
     apply_appearance(b);
     if (b->ext) b->ext->start();
     b->window = gtk_application_window_new(app);
@@ -1695,7 +1709,7 @@ static void activate(GtkApplication *app, gpointer data) {
     gtk_widget_set_margin_bottom(b->toolbar, 6);
     gtk_box_append(GTK_BOX(root), b->toolbar);
     {
-        b->bookmark_bar = gtk_scrolled_window_new();
+        b->bookmark_bar = gtk_scrolled_window_new(); gtk_widget_add_css_class(b->bookmark_bar, "bookmark-bar");
         gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(b->bookmark_bar), GTK_POLICY_AUTOMATIC, GTK_POLICY_NEVER);
         gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(b->bookmark_bar), TRUE);
         GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
@@ -1785,7 +1799,7 @@ static void activate(GtkApplication *app, gpointer data) {
     gtk_label_set_xalign(GTK_LABEL(b->status), 0.0f);
     gtk_widget_set_margin_start(b->status, 10); gtk_widget_set_margin_end(b->status, 10);
     gtk_widget_set_margin_top(b->status, 4); gtk_widget_set_margin_bottom(b->status, 4);
-    gtk_widget_add_css_class(b->status, "dim-label");
+    gtk_widget_add_css_class(b->status, "dim-label"); gtk_widget_add_css_class(b->status, "status");
     gtk_box_append(GTK_BOX(root), b->status);
 
     GtkEventController *keys = gtk_event_controller_key_new();
@@ -1841,16 +1855,89 @@ static void shutdown_app(GApplication *, gpointer data) {
     b->shutting_down = true;
 }
 
-static void apply_css() {
-    const char *css = R"CSS(.bookmarked{color:#e5b800;}.toolbar{background:alpha(@theme_bg_color,.94);border-bottom:1px solid alpha(@theme_fg_color,.10);}.address-entry{border-radius:10px;min-height:34px;padding-left:12px;padding-right:12px;}.notebook tab{padding:5px 8px;}.notebook tab label{font-size:0.92em;}.toolbar.compact-ui{padding-top:0;padding-bottom:0;}.toolbar.spacious-ui{padding-top:8px;padding-bottom:8px;})CSS";
-    GtkCssProvider *provider = gtk_css_provider_new();
+static const char *kBaseCss = R"CSS(
+.bookmarked{color:#e5b800;}
+.toolbar{padding:4px 0;}
+.address-entry{border-radius:999px;min-height:36px;padding-left:16px;padding-right:16px;}
+.notebook tab{padding:6px 10px;border-radius:9px;margin:2px 4px;min-height:30px;}
+.notebook tab label{font-size:0.92em;}
+.toolbar.compact-ui{padding-top:0;padding-bottom:0;}
+.toolbar.spacious-ui{padding-top:8px;padding-bottom:8px;}
+.toolbar button{border-radius:9px;min-width:34px;min-height:34px;padding:0 8px;}
+popover > contents{border-radius:14px;padding:6px;}
+popover button.flat{border-radius:8px;padding:7px 12px;}
+.ext-badge{border-radius:8px;}
+)CSS";
+
+static const char *kDarkCss = R"CSS(
+@define-color reed_bg #14161b;
+@define-color reed_surface #1a1d23;
+@define-color reed_raised #242832;
+@define-color reed_border #2d323d;
+@define-color reed_text #e6e8ec;
+@define-color reed_muted #8f98a6;
+window, window.background, dialog, .background { background-color:@reed_bg; color:@reed_text; }
+headerbar, headerbar.default-decoration { background:@reed_surface; color:@reed_text; border-bottom:1px solid @reed_border; box-shadow:none; }
+.toolbar { background:@reed_surface; border-bottom:1px solid @reed_border; color:@reed_text; }
+.toolbar button, popover button.flat, .bookmark-bar button { background:transparent; color:@reed_text; border:1px solid transparent; box-shadow:none; }
+.toolbar button:hover, popover button.flat:hover, .bookmark-bar button:hover { background:@reed_raised; }
+.toolbar button:active { background:alpha(white,.10); }
+.toolbar button.bookmarked { color:#e5b800; }
+.toolbar button:disabled { opacity:.35; }
+entry, entry.address-entry { background:#0f1115; color:@reed_text; border:1px solid @reed_border; box-shadow:none; caret-color:@reed_text; }
+entry text { background:transparent; border:none; box-shadow:none; outline:none; }
+entry:focus-within { border-color:@reed_border; }
+entry selection { background:alpha(white,.22); }
+.notebook, notebook { background:@reed_bg; }
+notebook > header { background:#101216; border:none; }
+notebook > header.left { border-right:1px solid @reed_border; }
+notebook > header.right { border-left:1px solid @reed_border; }
+notebook > header.top { border-bottom:1px solid @reed_border; }
+notebook > header.bottom { border-top:1px solid @reed_border; }
+notebook > header tab { background:transparent; color:@reed_muted; border:none; box-shadow:none; }
+notebook > header tab:hover { background:alpha(white,.05); color:@reed_text; }
+notebook > header tab:checked { background:@reed_raised; color:@reed_text; }
+notebook > stack { background:@reed_bg; }
+popover > contents, popover.menu > contents { background:@reed_raised; color:@reed_text; border:1px solid @reed_border; box-shadow:0 10px 30px alpha(black,.5); }
+popover separator, separator { background:@reed_border; }
+button { background:@reed_raised; color:@reed_text; border:1px solid @reed_border; box-shadow:none; background-image:none; }
+button:hover { background:#2d323d; }
+button.flat { background:transparent; border-color:transparent; }
+button.flat:hover { background:@reed_raised; }
+list, listview, row { background:transparent; color:@reed_text; }
+row:hover { background:alpha(white,.05); }
+row:selected { background:alpha(white,.12); }
+scrolledwindow, viewport { background:transparent; }
+scrollbar slider { background:alpha(white,.22); border-radius:6px; min-width:6px; min-height:6px; }
+scrollbar slider:hover { background:alpha(white,.4); }
+.dim-label, label.dim-label { color:@reed_muted; opacity:1; }
+tooltip, tooltip.background { background:@reed_raised; color:@reed_text; border:1px solid @reed_border; border-radius:8px; }
+.status, label.status { color:@reed_muted; padding:2px 10px; }
+progressbar > trough { background:@reed_raised; min-height:3px; }
+)CSS";
+
+static GtkCssProvider *g_base_provider = nullptr, *g_dark_provider = nullptr;
+static void load_provider(GtkCssProvider *p, const char *css) {
 #if GTK_CHECK_VERSION(4, 12, 0)
-    gtk_css_provider_load_from_string(provider, css);
+    gtk_css_provider_load_from_string(p, css);
 #else
-    gtk_css_provider_load_from_data(provider, css, -1);
+    gtk_css_provider_load_from_data(p, css, -1);
 #endif
-    gtk_style_context_add_provider_for_display(gdk_display_get_default(), GTK_STYLE_PROVIDER(provider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    g_object_unref(provider);
+}
+static void apply_css(bool dark) {
+    GdkDisplay *d = gdk_display_get_default();
+    if (!d) return;
+    if (!g_base_provider) {
+        g_base_provider = gtk_css_provider_new();
+        load_provider(g_base_provider, kBaseCss);
+        gtk_style_context_add_provider_for_display(d, GTK_STYLE_PROVIDER(g_base_provider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+    if (!g_dark_provider) {
+        g_dark_provider = gtk_css_provider_new();
+        load_provider(g_dark_provider, kDarkCss);
+    }
+    gtk_style_context_remove_provider_for_display(d, GTK_STYLE_PROVIDER(g_dark_provider));
+    if (dark) gtk_style_context_add_provider_for_display(d, GTK_STYLE_PROVIDER(g_dark_provider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 }
 
 } // namespace
