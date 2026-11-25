@@ -29,6 +29,22 @@ function report(path) {
     post("log", { msg: "unsupported API used: " + path }).catch(() => {});
 }
 
+// Surface uncaught errors from extension pages in the browser's stderr; otherwise a
+// page that dies during start-up (a blank popup, say) leaves no trace at all.
+if (ctx !== "content") {
+    const send = (m) => { try { post("log", { msg: "[" + ctx + "] " + m }).catch(() => {}); } catch (_) {} };
+    addEventListener("error", (ev) => send("error: " + ev.message + " (" + (ev.filename || "").split("/").slice(-2).join("/") + ":" + ev.lineno + ")"));
+    addEventListener("unhandledrejection", (ev) => send("unhandled rejection: " + (ev.reason && (ev.reason.stack || ev.reason.message) || ev.reason)));
+    const ce = console.error.bind(console);
+    console.error = (...a) => { send("console.error: " + a.map((x) => (x && x.stack) || String(x)).join(" ")); ce(...a); };
+}
+
+// WebKit has no requestIdleCallback; uBlock Origin (and others) call it unconditionally.
+if (typeof self.requestIdleCallback !== "function") {
+    self.requestIdleCallback = (fn, opts) => setTimeout(() => fn({ didTimeout: false, timeRemaining: () => 10 }), Math.min((opts && opts.timeout) || 1, 50));
+    self.cancelIdleCallback = (id) => clearTimeout(id);
+}
+
 // ---- events ----------------------------------------------------------------
 class Ev {
     constructor(name) { this._l = new Set(); this._name = name; }
@@ -160,6 +176,11 @@ const runtime = wrapAll({
     setUninstallURL: () => undefined,
     reload: () => { report("runtime.reload"); },
 });
+// getURL and getManifest are synchronous in real WebExtensions; wrapAll() turned them into
+// promises, which made extensions like uBlock Origin die in start-up code such as
+// `browser.runtime.getURL("").startsWith("moz-extension://")`.
+runtime.getURL = (p) => baseUrl + String(p === undefined ? "" : p).replace(/^\//, "");
+runtime.getManifest = () => JSON.parse(JSON.stringify(manifest));
 runtime.connect = (a, b) => makePort((typeof a === "object" && a !== null ? a : b) || {}, null);  // synchronous: not promise-wrapped
 runtime.onMessage = ev("runtime.onMessage");
 runtime.onConnect = ev("runtime.onConnect");

@@ -967,6 +967,14 @@ static void show_settings(Browser *b) {
     GtkWidget *theme = gtk_drop_down_new_from_strings(theme_options);
     gtk_drop_down_set_selected(GTK_DROP_DOWN(theme), b->theme == "dark" ? 2 : b->theme == "light" ? 1 : 0); gtk_widget_set_halign(theme, GTK_ALIGN_START); gtk_widget_set_size_request(theme, 240, -1); gtk_box_append(GTK_BOX(appearance), theme);
     g_signal_connect(theme, "notify::selected", G_CALLBACK(+[](GObject *o, GParamSpec*, gpointer d){ guint v=gtk_drop_down_get_selected(GTK_DROP_DOWN(o)); set_theme(static_cast<Browser*>(d), v==2?"dark":v==1?"light":"system"); }), b);
+    settings_section("Bookmarks bar", "Show your bookmarks in a row under the toolbar. You can also press Ctrl+Shift+B.", appearance);
+    GtkWidget *bar_check = gtk_check_button_new_with_label("Show bookmarks bar");
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(bar_check), gtk_widget_get_visible(b->bookmark_bar));
+    g_signal_connect(bar_check, "toggled", G_CALLBACK(+[](GtkCheckButton *c, gpointer d) {
+        Browser *br = static_cast<Browser *>(d);
+        if (gtk_check_button_get_active(c) != gtk_widget_get_visible(br->bookmark_bar)) toggle_bookmark_bar(br);
+    }), b);
+    gtk_box_append(GTK_BOX(appearance), bar_check);
     settings_section("Accent color", "Choose a preset or enter any HEX color such as #8b5cf6.", appearance);
     GtkWidget *presets = gtk_flow_box_new(); gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(presets), GTK_SELECTION_NONE); gtk_flow_box_set_max_children_per_line(GTK_FLOW_BOX(presets), 8); gtk_flow_box_set_row_spacing(GTK_FLOW_BOX(presets), 8); gtk_flow_box_set_column_spacing(GTK_FLOW_BOX(presets), 8);
     const char *colors[] = {"#3584e4","#e66100","#26a269","#9141ac","#c01c28","#1c71d8","#986a44","#5e5c64","#d33682","#00a6a6"};
@@ -1631,8 +1639,13 @@ static void rebuild_bookmark_bar(Browser *b) {
     gtk_widget_add_css_class(more, "flat");
     g_signal_connect_swapped(more, "clicked", G_CALLBACK(+[](gpointer d) { show_bookmark_manager(static_cast<Browser *>(d)); }), b);
     gtk_box_append(GTK_BOX(row), more);
+    GtkWidget *hide = gtk_button_new_from_icon_name("window-close-symbolic");
+    gtk_widget_add_css_class(hide, "flat"); gtk_widget_set_hexpand(hide, TRUE); gtk_widget_set_halign(hide, GTK_ALIGN_END);
+    gtk_widget_set_tooltip_text(hide, "Hide bookmarks bar (Ctrl+Shift+B)");
+    g_signal_connect_swapped(hide, "clicked", G_CALLBACK(+[](gpointer d) { toggle_bookmark_bar(static_cast<Browser *>(d)); }), b);
+    gtk_box_append(GTK_BOX(row), hide);
     std::string pref = b->store.meta("bookmark_bar");
-    gtk_widget_set_visible(b->bookmark_bar, pref == "1" || (pref.empty() && !all.empty()));
+    gtk_widget_set_visible(b->bookmark_bar, pref == "1");  // hidden unless the user turned it on
 }
 
 static void toggle_bookmark_bar(Browser *b) {
