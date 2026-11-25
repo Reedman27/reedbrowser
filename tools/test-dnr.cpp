@@ -1,5 +1,6 @@
 // Build: g++ -std=c++17 -Isrc tools/test-dnr.cpp $(pkg-config --cflags --libs json-glib-1.0 webkitgtk-6.0) -o /tmp/test-dnr
 // Converts sample DNR rules and asks WebKit to compile the result (proves the syntax is accepted).
+#undef NDEBUG  // the checks below have side effects and must run in Release builds
 #include <webkit/webkit.h>
 #include <cassert>
 #include <cstdio>

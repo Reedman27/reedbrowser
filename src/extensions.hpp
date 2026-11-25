@@ -40,6 +40,8 @@ public:
     bool install(const std::string &path, bool assume_yes, std::string *message);
     // Thread-safe: download an AMO page/amo:slug or a direct https XPI to `destination`.
     static bool fetch_package(const std::string &source, const std::string &destination, std::string *err);
+    // Unpack to a scratch directory and describe what the extension asks for (for the consent dialog).
+    bool inspect(const std::string &path, std::string *summary, std::string *err);
     bool remove(const std::string &id_or_name, std::string *message);
     std::string describe() const;  // human-readable list
 
@@ -64,7 +66,7 @@ public:
     void action_clicked(const std::string &uuid, int tab_id);  // for buttons without a popup
     void set_ui_callbacks(std::function<void()> actions_changed, std::function<void(const std::string &uuid)> open_options);
     void start_new();                                    // start extensions installed while running
-    void set_enabled(const std::string &uuid, bool on);  // content scripts follow after a restart
+    void set_enabled(const std::string &uuid, bool on);  // stops / starts it immediately, including in open tabs
 
     // Extension entries for the page context menu (menus.create / contextMenus.create).
     struct MenuItem { std::string uuid, ext_name, id, title, parent, type; bool enabled = true, checked = false; };

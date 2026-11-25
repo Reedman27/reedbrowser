@@ -29,3 +29,13 @@ Rules are converted to WebKit content rule lists (`src/dnr.hpp`). Supported: blo
 
 ## Tested
 `tests/extension/` (MV2 basics) and `tests/extension-mv3/` (popup, options, ports both ways, scripting.executeScript, tabs.executeScript, insertCSS, registerContentScripts, static + dynamic declarativeNetRequest blocking, badge, background-to-popup messages, page context-menu items) under Xvfb on Ubuntu with WebKitGTK 2.52. Run the MV3 one with the files in `tests/extension-mv3/site/` served on 127.0.0.1:8099. Not tested on Fedora 45 or with real store extensions.
+
+## Permissions (enforced at runtime)
+
+- API namespaces need their manifest permission (`storage`, `cookies`, `menus`/`contextMenus`, `scripting`, `webRequest`, `declarativeNetRequest*`); otherwise the call is refused and logged.
+- `tabs.query/get` and tab events only include `url`/`title` for extensions with the `tabs` permission, host access to that page, or an `activeTab` grant.
+- `scripting.*` / `tabs.executeScript` / `insertCSS` need host access (or `activeTab`) for the target tab; `cookies.*` need host access for the cookie's site.
+- `activeTab` is granted when the user clicks the toolbar button, opens the popup or uses a context-menu item, and ends when that tab navigates or closes.
+- `optional_permissions` are never granted (`permissions.request()` declines).
+- Disabling or removing an extension stops its background page, closes its popup/options pages and removes its scripts, styles, handlers and network rules from open tabs immediately. Installing attaches to open tabs without a restart.
+- Every file path named by a manifest or by `scripting.*` goes through one resolver that rejects `..`, absolute paths and symlinks leaving the extension directory.

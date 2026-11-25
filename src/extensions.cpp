@@ -151,6 +151,7 @@ struct Ext {
     std::vector<std::string> bg_scripts;
     bool bg_module = false;
     bool enabled = true;
+    bool removed = false;  // uninstalled: the record is kept alive (graveyard) so late callbacks never dangle
     std::string pending_event;  // "install" or "update", delivered once to onInstalled
     std::string messages_json = "null";
     std::map<std::string, Json> storage;  // area -> JSON object node
@@ -185,6 +186,8 @@ struct Ext {
     };
     std::vector<Reg> registered;
     bool has_permission(const std::string &perm) const;
+    bool host_allowed(const std::string &url) const;
+    std::set<int> active_tab_grants;  // tabs the user invoked the extension on (activeTab); cleared on navigation
 };
 
 struct BgCtx { ExtensionManager::Impl *mgr; Ext *ext; };
@@ -210,7 +213,13 @@ struct ExtensionManager::Impl {
     WebKitNetworkSession *session;
     Host host;
     std::vector<std::unique_ptr<Ext>> exts;
-    struct ViewInfo { WebKitUserContentManager *ucm; int tab_id; std::vector<Ext *> attached; };
+    struct Added { std::vector<WebKitUserScript *> scripts; std::vector<WebKitUserStyleSheet *> sheets; gulong handler_id = 0; std::string handler, world; };
+    struct ViewInfo { WebKitUserContentManager *ucm; int tab_id; std::vector<Ext *> attached; std::map<Ext *, Added> added; };
+    std::vector<std::unique_ptr<Ext>> graveyard;  // uninstalled extensions; see Ext::removed
+    bool attach_ext(Ext &e, WebKitWebView *view, ViewInfo &info);
+    void detach_ext(Ext &e, ViewInfo &info);
+    void unload(Ext &e);    // stop everything the extension is running; keeps the record
+    void activate(Ext &e);  // (re)start an enabled extension, including in already-open tabs
     std::map<WebKitWebView *, ViewInfo> views;
     std::map<int, WebKitWebView *> tab_views;
     bool scheme_registered = false;
@@ -254,7 +263,10 @@ struct ExtensionManager::Impl {
     void respond(ReplyHandle *r, const std::string &envelope);
     void respond_ok(ReplyHandle *r, const std::string &value_json) { respond(r, "{\"ok\":true,\"value\":" + value_json + "}"); }
     void respond_err(ReplyHandle *r, const std::string &msg) { respond(r, "{\"ok\":false,\"error\":" + quote(msg) + "}"); }
-    std::string tab_json(const TabInfo &t);
+    std::string tab_json(const TabInfo &t, const Ext *viewer = nullptr);
+    bool tab_access(const Ext &e, int tab_id, const std::string &url) const { return e.host_allowed(url) || e.active_tab_grants.count(tab_id); }
+    bool tab_target(Ext &e, JsonNode *idnode, int *id, std::string *url);
+    void fire_filtered(const std::string &name, const std::function<std::string(Ext &)> &args_for);
     std::string sender_json(MsgCtx *c, const std::string &url, bool top);
     void run_js(WebKitWebView *view, const std::string &world, const std::string &body, const std::string &param,
                 std::function<void(bool ok, const std::string &json_or_error)> done);
@@ -407,8 +419,25 @@ bool ExtensionManager::Impl::load_manifest(Ext &e, std::string *err) {
 
 bool Ext::has_permission(const std::string &perm) const {
     JsonObject *m = manifest.obj();
-    for (const char *k : {"permissions", "optional_permissions"})
-        for (const auto &p : strings_of(m, k)) if (p == perm) return true;
+    for (const auto &p : strings_of(m, "permissions")) if (p == perm) return true;
+    return false;  // optional_permissions are not granted: permissions.request() always declines
+}
+
+// Host access: manifest host_permissions plus URL-pattern entries in "permissions" (MV2 style).
+bool Ext::host_allowed(const std::string &url) const {
+    if (url.empty()) return false;
+    JsonObject *m = manifest.obj();
+    std::vector<std::string> pats = strings_of(m, "host_permissions");
+    for (const auto &p : strings_of(m, "permissions")) if (p == "<all_urls>" || p.find("://") != std::string::npos) pats.push_back(p);
+    for (const auto &p : pats) {
+        GError *err = nullptr;
+        WebKitWebExtensionMatchPattern *mp = webkit_web_extension_match_pattern_new_with_string(p.c_str(), &err);
+        if (err) { g_error_free(err); continue; }
+        if (!mp) continue;
+        bool ok = webkit_web_extension_match_pattern_matches_url(mp, url.c_str(), WEBKIT_WEB_EXTENSION_MATCH_PATTERN_OPTIONS_NONE);
+        webkit_web_extension_match_pattern_unref(mp);
+        if (ok) return true;
+    }
     return false;
 }
 
@@ -601,9 +630,41 @@ static bool extract_archive(const std::string &file, const std::string &dest, st
     return ok;
 }
 
+static std::string make_report(const Ext &probe, const std::string &id) {
+    JsonObject *m = probe.manifest.obj();
+    std::string perms;
+    for (const auto &p : strings_of(m, "permissions")) perms += "    " + p + "\n";
+    for (const auto &p : strings_of(m, "host_permissions")) perms += "    " + p + "\n";
+    std::string report = "Extension: " + probe.name + " " + probe.version + "\n  id: " + id +
+                         "\n  manifest version: " + std::to_string(probe.mv) + "\n  requests:\n" + (perms.empty() ? "    (none)\n" : perms);
+    if (!probe.scripts.empty()) {
+        report += "  runs scripts on:\n";
+        std::set<std::string> seen;
+        for (auto &s : probe.scripts) for (auto &p : s.matches) if (seen.insert(p).second) report += "    " + p + "\n";
+    }
+    report += "  Note: API and site access is enforced at runtime; optional permissions are not granted.\n";
+    return report;
+}
+
 bool ExtensionManager::fetch_package(const std::string &source, const std::string &destination, std::string *err) {
     if (source.rfind("https://", 0) == 0 && source.find("/addon/") == std::string::npos) return download_https_file(source, destination, err);
     return download_amo_xpi(source, destination, err);
+}
+
+bool ExtensionManager::inspect(const std::string &path, std::string *summary, std::string *err) {
+    std::error_code ec;
+    if (!fs::exists(path)) { *err = "No such file or directory: " + path; return false; }
+    std::string staging = d_->ext_dir + "/.inspect-" + std::to_string(getpid()) + "-" + std::to_string(g_get_monotonic_time());
+    fs::create_directories(staging, ec);
+    struct Cleanup { std::string p; ~Cleanup() { std::error_code e; fs::remove_all(p, e); } } cleanup{staging};
+    if (fs::is_directory(path)) fs::copy(path, staging, fs::copy_options::recursive, ec);
+    else { std::string e2; if (!extract_archive(path, staging, &e2)) { *err = "Could not unpack extension: " + e2; return false; } }
+    if (ec) { *err = "Could not copy extension: " + ec.message(); return false; }
+    Ext probe; probe.dir = staging;
+    std::string e3;
+    if (!d_->load_manifest(probe, &e3)) { *err = "Not a valid extension: " + e3; return false; }
+    *summary = make_report(probe, probe.name);
+    return true;
 }
 
 bool ExtensionManager::install(const std::string &path, bool assume_yes, std::string *message) {
@@ -642,17 +703,7 @@ bool ExtensionManager::install(const std::string &path, bool assume_yes, std::st
         g_free(sum);
     }
 
-    std::string perms;
-    for (const auto &p : strings_of(m, "permissions")) perms += "    " + p + "\n";
-    for (const auto &p : strings_of(m, "host_permissions")) perms += "    " + p + "\n";
-    std::string report = "Extension: " + probe.name + " " + probe.version + "\n  id: " + id +
-                         "\n  manifest version: " + std::to_string(probe.mv) + "\n  requests:\n" + (perms.empty() ? "    (none)\n" : perms);
-    if (!probe.scripts.empty()) {
-        report += "  runs scripts on:\n";
-        std::set<std::string> seen;
-        for (auto &s : probe.scripts) for (auto &p : s.matches) if (seen.insert(p).second) report += "    " + p + "\n";
-    }
-    report += "  Note: permissions are granted as listed; per-site permission prompts are not implemented yet.\n";
+    std::string report = make_report(probe, id);
     if (!assume_yes) {
         std::cerr << report << "Install this extension? [y/N] " << std::flush;
         std::string ans;
@@ -678,7 +729,7 @@ bool ExtensionManager::install(const std::string &path, bool assume_yes, std::st
         d_->exts.push_back(std::move(e));
     }
     d_->save_registry();
-    *message = "Installed " + probe.name + " (" + id + "). Restart ReedBrowser to load it.";
+    *message = "Installed " + probe.name + " (" + id + "). It is active now; reload open tabs to apply its content scripts.";
     return true;
 }
 
@@ -686,10 +737,14 @@ bool ExtensionManager::remove(const std::string &which, std::string *message) {
     Ext *e = d_->by_name(which);
     if (!e) { *message = "No extension matches '" + which + "'."; return false; }
     std::error_code ec;
+    std::string name = e->name;
+    e->removed = true; e->enabled = false;
+    d_->unload(*e);  // before the files go: nothing may keep running or pointing at this extension
     fs::remove_all(e->dir, ec);
     fs::remove_all(d_->store_dir + "/" + e->uuid, ec);
-    std::string name = e->name;
-    d_->exts.erase(std::remove_if(d_->exts.begin(), d_->exts.end(), [&](auto &p) { return p.get() == e; }), d_->exts.end());
+    for (auto &p : d_->exts) if (p.get() == e) d_->graveyard.push_back(std::move(p));
+    d_->exts.erase(std::remove_if(d_->exts.begin(), d_->exts.end(), [](auto &p) { return !p; }), d_->exts.end());
+    d_->notify_actions();
     d_->save_registry();
     *message = "Removed " + name + ".";
     return true;
@@ -805,6 +860,23 @@ void ExtensionManager::Impl::fire(Ext &e, const std::string &name, const std::st
         if (std::find(info.attached.begin(), info.attached.end(), &e) != info.attached.end())
             run_js(view, "reed-ext-" + e.uuid, body, args_json, nullptr);
 }
+void ExtensionManager::Impl::fire_filtered(const std::string &name, const std::function<std::string(Ext &)> &args_for) {
+    for (auto &e : exts) {
+        if (!e->enabled || !e->bg) continue;
+        std::string a = args_for(*e);
+        if (!a.empty()) fire(*e, name, a, false);
+    }
+}
+
+bool ExtensionManager::Impl::tab_target(Ext &e, JsonNode *idnode, int *id, std::string *url) {
+    int t = -1;
+    if (idnode && JSON_NODE_HOLDS_VALUE(idnode) && json_node_get_value_type(idnode) != G_TYPE_STRING) t = static_cast<int>(json_node_get_int(idnode));
+    if (t < 0 && host.list_tabs) for (auto &x : host.list_tabs()) if (x.active) t = x.id;
+    if (host.list_tabs) for (auto &x : host.list_tabs()) if (x.id == t) { *id = t; *url = x.url; return true; }
+    (void)e;
+    return false;
+}
+
 void ExtensionManager::Impl::fire_all(const std::string &name, const std::string &args_json) {
     for (auto &e : exts) if (e->enabled && e->bg) fire(*e, name, args_json, false);
 }
@@ -818,8 +890,12 @@ void ExtensionManager::Impl::respond(ReplyHandle *r, const std::string &envelope
     delete r;
 }
 
-std::string ExtensionManager::Impl::tab_json(const TabInfo &t) {
-    return "{\"id\":" + std::to_string(t.id) + ",\"windowId\":1,\"index\":0,\"url\":" + quote(t.url) + ",\"title\":" + quote(t.title) +
+// With `viewer`, url/title are only included when the extension may see them (the "tabs"
+// permission, host access to that page, or an activeTab grant), like Firefox.
+std::string ExtensionManager::Impl::tab_json(const TabInfo &t, const Ext *viewer) {
+    bool see = !viewer || viewer->has_permission("tabs") || tab_access(*viewer, t.id, t.url);
+    return "{\"id\":" + std::to_string(t.id) + ",\"windowId\":1,\"index\":0" +
+           (see ? ",\"url\":" + quote(t.url) + ",\"title\":" + quote(t.title) : std::string()) +
            ",\"active\":" + (t.active ? "true" : "false") + ",\"highlighted\":" + (t.active ? "true" : "false") +
            ",\"incognito\":false,\"pinned\":false,\"status\":\"complete\"}";
 }
@@ -947,6 +1023,19 @@ void ExtensionManager::Impl::dispatch(MsgCtx *c, const std::string &op, JsonObje
     Ext &e = *c->ext;
     bool is_bg = c->tab_id < 0;
     if (op == "log") { g_message("[extension %s] %s", e.name.c_str(), str_of(args, "msg").c_str()); respond_ok(r, "null"); return; }
+    {   // API permissions: every namespace that needs a manifest permission is checked here, in one place
+        struct Need { const char *prefix; std::vector<const char *> any_of; };
+        static const std::vector<Need> needs = {
+            {"storage.", {"storage"}}, {"menus.", {"menus", "contextMenus"}}, {"scripting.", {"scripting"}},
+            {"webreq.", {"webRequest", "webRequestBlocking"}}, {"cookies.", {"cookies"}},
+            {"dnr.", {"declarativeNetRequest", "declarativeNetRequestWithHostAccess", "declarativeNetRequestFeedback"}}};
+        for (auto &n : needs) {
+            if (op.rfind(n.prefix, 0) != 0) continue;
+            bool ok = false;
+            for (const char *perm : n.any_of) if (e.has_permission(perm)) ok = true;
+            if (!ok) { g_message("[extension %s] denied %s: missing \"%s\" permission", e.name.c_str(), op.c_str(), n.any_of[0]); respond_err(r, std::string("The \"") + n.any_of[0] + "\" permission is required for " + op + "."); return; }
+        }
+    }
     if (op.rfind("storage.", 0) == 0) { storage_op(e, op, args, r); return; }
 
     if (op == "runtime.sendMessage") {
@@ -1009,14 +1098,14 @@ void ExtensionManager::Impl::dispatch(MsgCtx *c, const std::string &op, JsonObje
             if (q && !matches_filter(t, q)) continue;
             if (!first) out += ",";
             first = false;
-            out += tab_json(t);
+            out += tab_json(t, &e);
         }
         respond_ok(r, out + "]");
         return;
     }
     if (op == "tabs.get") {
         int id = static_cast<int>(json_node_get_int(member(args, "id")));
-        if (host.list_tabs) for (auto &t : host.list_tabs()) if (t.id == id) { respond_ok(r, tab_json(t)); return; }
+        if (host.list_tabs) for (auto &t : host.list_tabs()) if (t.id == id) { respond_ok(r, tab_json(t, &e)); return; }
         respond_err(r, "Invalid tab ID: " + std::to_string(id));
         return;
     }
@@ -1025,7 +1114,7 @@ void ExtensionManager::Impl::dispatch(MsgCtx *c, const std::string &op, JsonObje
         std::string url = str_of(p, "url");
         bool active = p && member(p, "active") ? bool_of(p, "active", true) : true;
         int id = host.open_tab ? host.open_tab(url, active) : -1;
-        if (host.list_tabs) for (auto &t : host.list_tabs()) if (t.id == id) { respond_ok(r, tab_json(t)); return; }
+        if (host.list_tabs) for (auto &t : host.list_tabs()) if (t.id == id) { respond_ok(r, tab_json(t, &e)); return; }
         respond_ok(r, "{\"id\":" + std::to_string(id) + "}");
         return;
     }
@@ -1048,7 +1137,7 @@ void ExtensionManager::Impl::dispatch(MsgCtx *c, const std::string &op, JsonObje
             if (!url.empty()) webkit_web_view_load_uri(it->second, url.c_str());
             if (p && bool_of(p, "active") && host.activate_tab) host.activate_tab(id);
         }
-        if (host.list_tabs) for (auto &t : host.list_tabs()) if (t.id == id) { respond_ok(r, tab_json(t)); return; }
+        if (host.list_tabs) for (auto &t : host.list_tabs()) if (t.id == id) { respond_ok(r, tab_json(t, &e)); return; }
         respond_ok(r, "null");
         return;
     }
@@ -1065,6 +1154,10 @@ void ExtensionManager::Impl::dispatch(MsgCtx *c, const std::string &op, JsonObje
 }
 
 void ExtensionManager::Impl::on_message(MsgCtx *c, JSCValue *value, WebKitScriptMessageReply *reply) {
+    if (c->ext->removed || !c->ext->enabled) {  // disabled/uninstalled while a page still had the bridge
+        webkit_script_message_reply_return_error_message(reply, "Extension is not running");
+        return;
+    }
     auto *r = new ReplyHandle{webkit_script_message_reply_ref(reply), static_cast<JSCContext *>(g_object_ref(jsc_value_get_context(value)))};
     char *js = jsc_value_to_json(value, 0);
     Json msg = parse(js ? js : "");
@@ -1136,10 +1229,19 @@ static std::string sha_key(const std::string &s) {
     std::string r = h; g_free(h); return r.substr(0, 16);
 }
 
+// The one way to read a file named by an extension (manifest paths, scripting.* files, ...).
+// Rejects "..", absolute paths and symlinks that resolve outside the extension directory.
 static std::string read_ext_file(const Ext &e, const std::string &rel) {
     fs::path r = fs::path(rel).relative_path().lexically_normal();
     for (auto &part : r) if (part == "..") return "";
-    return read_file(e.dir + "/" + r.string());
+    std::error_code ec;
+    fs::path root = fs::weakly_canonical(fs::path(e.dir), ec);
+    if (ec) return "";
+    fs::path full = fs::weakly_canonical(root / r, ec);
+    if (ec) return "";
+    auto rel_to_root = full.lexically_relative(root);
+    if (rel_to_root.empty() || *rel_to_root.begin() == "..") return "";
+    return read_file(full.string());
 }
 
 WebKitWebView *ExtensionManager::Impl::make_page_view(Ext &e, const char *ctx) {
@@ -1405,12 +1507,15 @@ bool ExtensionManager::Impl::dispatch_cookies(MsgCtx *c, const std::string &op, 
     WebKitCookieManager *cm = cookie_manager_for(session);
     JsonNode *dn = member(args, "d");
     JsonObject *d = dn && JSON_NODE_HOLDS_OBJECT(dn) ? json_node_get_object(dn) : nullptr;
-    struct Job { Impl *mgr; ReplyHandle *r; Json filter; std::string op, url; };
+    struct Job { Impl *mgr; ReplyHandle *r; Json filter; std::string op, url; Ext *ext; };
     if (op == "cookies.getAllCookieStores") { respond_ok(r, "[{\"id\":\"0\",\"incognito\":false,\"tabIds\":[]}]"); return true; }
     std::string url = str_of(d, "url");
+    if (!url.empty() && !e.host_allowed(url)) { respond_err(r, "Host permission required for " + url); return true; }
+    if (url.empty() && (op == "cookies.get" || op == "cookies.remove")) { respond_err(r, op + " requires a url"); return true; }
     if (op == "cookies.set") {
         std::string name = str_of(d, "name"), value = str_of(d, "value"), domain = str_of(d, "domain"), path = str_of(d, "path", "/");
         if (url.empty() && domain.empty()) { respond_err(r, "cookies.set requires a url"); return true; }
+        if (url.empty()) { std::string h = domain; if (!h.empty() && h[0] == '.') h.erase(0, 1); if (!e.host_allowed("https://" + h + "/")) { respond_err(r, "Host permission required for " + domain); return true; } }
         if (domain.empty()) { GUri *u = g_uri_parse(url.c_str(), G_URI_FLAGS_PARSE_RELAXED, nullptr); if (u) { domain = g_uri_get_host(u) ? g_uri_get_host(u) : ""; g_uri_unref(u); } }
         SoupCookie *ck = soup_cookie_new(name.c_str(), value.c_str(), domain.c_str(), path.c_str(), -1);
         if (bool_of(d, "secure")) soup_cookie_set_secure(ck, TRUE);
@@ -1436,7 +1541,7 @@ bool ExtensionManager::Impl::dispatch_cookies(MsgCtx *c, const std::string &op, 
         return true;
     }
     // get / getAll / remove: fetch candidate cookies, then filter
-    auto *job = new Job{this, r, Json(), op, url};
+    auto *job = new Job{this, r, Json(), op, url, &e};
     if (d) { JsonNode *cp = json_node_init_object(json_node_alloc(), d); job->filter = Json(cp); }
     auto finish = +[](GObject *src, GAsyncResult *res, gpointer ud) {
         std::unique_ptr<Job> j(static_cast<Job *>(ud));
@@ -1446,7 +1551,16 @@ bool ExtensionManager::Impl::dispatch_cookies(MsgCtx *c, const std::string &op, 
         if (err) { j->mgr->respond_err(j->r, err->message); g_error_free(err); return; }
         JsonObject *f = j->filter.obj();
         std::vector<SoupCookie *> hits;
-        for (GList *l = list; l; l = l->next) if (cookie_matches(static_cast<SoupCookie *>(l->data), f)) hits.push_back(static_cast<SoupCookie *>(l->data));
+        for (GList *l = list; l; l = l->next) {
+            auto *ck = static_cast<SoupCookie *>(l->data);
+            if (!cookie_matches(ck, f)) continue;
+            if (j->url.empty()) {  // getAll without a url: only cookies for hosts this extension may access
+                std::string dom = soup_cookie_get_domain(ck);
+                if (!dom.empty() && dom[0] == '.') dom.erase(0, 1);
+                if (!j->ext->host_allowed("https://" + dom + "/")) continue;
+            }
+            hits.push_back(ck);
+        }
         if (j->op == "cookies.getAll") {
             std::string out = "[";
             for (size_t i = 0; i < hits.size(); ++i) { if (i) out += ","; out += cookie_json(hits[i]); }
@@ -1619,6 +1733,12 @@ bool ExtensionManager::Impl::dispatch_extra(MsgCtx *c, const std::string &op, Js
     }
 
     // ---- script injection
+    if (op == "tabs.executeScript" || op == "scripting.executeScript" || op == "tabs.insertCSS" || op == "scripting.insertCSS" || op == "tabs.removeCSS" || op == "scripting.removeCSS") {
+        int tid = -1; std::string turl;
+        if (!tab_target(e, member(args, "tabId"), &tid, &turl)) { respond_err(r, "No tab with that id, or the tab cannot be scripted"); return true; }
+        if (!tab_access(e, tid, turl)) { respond_err(r, "Missing host permission for the tab"); return true; }
+        if (op.rfind("tabs.", 0) == 0 && !e.has_permission("tabs") && !e.has_permission("activeTab") && !e.host_allowed(turl)) { respond_err(r, "Missing host permission for the tab"); return true; }
+    }
     if (op == "tabs.executeScript" || op == "scripting.executeScript") {
         WebKitWebView *view = tab_view_for(member(args, "tabId"));
         if (!view) { respond_err(r, "No tab with that id, or the tab cannot be scripted"); return true; }
@@ -1828,8 +1948,9 @@ void ExtensionManager::context_menu_clicked(const std::string &uuid, const MenuC
     if (!c.selection.empty()) info += ",\"selectionText\":" + quote(c.selection);
     for (auto &m : e->menus) if (m.id == c.menu_id && (m.type == "checkbox" || m.type == "radio")) info += std::string(",\"wasChecked\":") + (m.checked ? "true" : "false") + ",\"checked\":" + (c.checked ? "true" : "false");
     info += "}";
+    e->active_tab_grants.insert(tab_id);
     std::string tab = "{\"id\":" + std::to_string(tab_id) + "}";
-    if (d_->host.list_tabs) for (auto &t : d_->host.list_tabs()) if (t.id == tab_id) tab = d_->tab_json(t);
+    if (d_->host.list_tabs) for (auto &t : d_->host.list_tabs()) if (t.id == tab_id) tab = d_->tab_json(t, e);
     d_->fire(*e, "menus.onClicked", "[" + info + "," + tab + "]", false);
     for (auto &m : e->menus) if (m.id == c.menu_id && (m.type == "checkbox" || m.type == "radio")) m.checked = c.checked;
 }
@@ -1866,6 +1987,7 @@ WebKitWebView *ExtensionManager::create_popup(const std::string &uuid) {
     if (!e || !e->enabled) return nullptr;
     std::string popup = e->action.count("setPopup") ? details_string(*e, "setPopup", "popup") : e->popup;
     if (popup.empty()) return nullptr;
+    if (d_->host.list_tabs) for (auto &t : d_->host.list_tabs()) if (t.active) e->active_tab_grants.insert(t.id);  // activeTab
     WebKitWebView *v = d_->make_page_view(*e, "popup");
     std::string url = "moz-extension://" + e->uuid + "/" + popup;
     webkit_web_view_load_uri(v, url.c_str());
@@ -1884,8 +2006,9 @@ WebKitWebView *ExtensionManager::create_options(const std::string &uuid) {
 void ExtensionManager::action_clicked(const std::string &uuid, int tab_id) {
     Ext *e = d_->by_uuid(uuid);
     if (!e || !e->enabled || !e->bg) return;
+    e->active_tab_grants.insert(tab_id);  // activeTab: the user invoked the extension on this tab
     std::string tab = "{\"id\":" + std::to_string(tab_id) + "}";
-    if (d_->host.list_tabs) for (auto &t : d_->host.list_tabs()) if (t.id == tab_id) tab = d_->tab_json(t);
+    if (d_->host.list_tabs) for (auto &t : d_->host.list_tabs()) if (t.id == tab_id) tab = d_->tab_json(t, e);
     d_->fire(*e, "action.onClicked", "[" + tab + ",{\"modifiers\":[],\"button\":0}]", false);
 }
 
@@ -1895,7 +2018,7 @@ void ExtensionManager::set_ui_callbacks(std::function<void()> actions_changed, s
 }
 
 void ExtensionManager::start_new() {
-    for (auto &e : d_->exts) if (e->enabled && !e->bg_started) { d_->load_dnr_state(*e); d_->start_background(*e); }
+    for (auto &e : d_->exts) if (e->enabled && !e->bg_started) d_->activate(*e);  // also attaches to open tabs
     d_->notify_actions();
 }
 
@@ -1903,6 +2026,7 @@ void ExtensionManager::set_enabled(const std::string &uuid, bool on) {
     Ext *e = d_->by_uuid(uuid);
     if (!e || e->enabled == on) return;
     e->enabled = on;
+    if (on) d_->activate(*e); else d_->unload(*e);
     d_->save_registry();
     d_->notify_actions();
 }
@@ -1915,34 +2039,34 @@ void ExtensionManager::start() {
 
 // -------------------------------------------------------------- tab attachment
 
-void ExtensionManager::attach_view(WebKitWebView *view, WebKitUserContentManager *ucm, int tab_id, bool is_private) {
-    if (is_private) return;  // like Firefox, extensions do not run in private windows by default
-    Impl::ViewInfo info{ucm, tab_id, {}};
-    for (auto &up : d_->exts) {
-        Ext &e = *up;
-        bool wants_api = !e.scripts.empty() || !e.registered.empty() || e.has_permission("scripting") || e.has_permission("contentScripts");
-        if (!e.enabled || !wants_api) continue;
-        std::string world = "reed-ext-" + e.uuid;
-        webkit_user_content_manager_register_script_message_handler_with_reply(ucm, e.handler.c_str(), world.c_str());
-        auto *ctx = new MsgCtx{d_.get(), &e, tab_id, view};
-        g_signal_connect_data(ucm, ("script-message-with-reply-received::" + e.handler).c_str(),
-            G_CALLBACK(+[](WebKitUserContentManager *, JSCValue *v, WebKitScriptMessageReply *reply, gpointer ud) -> gboolean {
-                auto *c = static_cast<MsgCtx *>(ud);
-                c->mgr->on_message(c, v, reply);
-                return TRUE;
-            }), ctx, +[](gpointer d, GClosure *) { delete static_cast<MsgCtx *>(d); }, GConnectFlags(0));
+bool ExtensionManager::Impl::attach_ext(Ext &e, WebKitWebView *view, ViewInfo &info) {
+    WebKitUserContentManager *ucm = info.ucm;
+    int tab_id = info.tab_id;
+    bool wants_api = !e.scripts.empty() || !e.registered.empty() || e.has_permission("scripting") || e.has_permission("contentScripts");
+    if (!e.enabled || e.removed || !wants_api || info.added.count(&e)) return false;
+    Added &ad = info.added[&e];
+    std::string world = "reed-ext-" + e.uuid;
+    ad.handler = e.handler; ad.world = world;
+    webkit_user_content_manager_register_script_message_handler_with_reply(ucm, e.handler.c_str(), world.c_str());
+    auto *ctx = new MsgCtx{this, &e, tab_id, view};
+    ad.handler_id = g_signal_connect_data(ucm, ("script-message-with-reply-received::" + e.handler).c_str(),
+        G_CALLBACK(+[](WebKitUserContentManager *, JSCValue *v, WebKitScriptMessageReply *reply, gpointer ud) -> gboolean {
+            auto *c = static_cast<MsgCtx *>(ud);
+            c->mgr->on_message(c, v, reply);
+            return TRUE;
+        }), ctx, +[](gpointer d, GClosure *) { delete static_cast<MsgCtx *>(d); }, GConnectFlags(0));
 
-        std::vector<std::string> all;
-        for (auto &s : e.scripts) for (auto &m : s.matches) convert_pattern(m, all);
-        for (auto &g : e.registered) for (auto &m : g.matches) convert_pattern(m, all);
-        if (e.has_permission("scripting") || e.has_permission("contentScripts")) convert_pattern("<all_urls>", all);
-        if (all.empty()) continue;
+    std::vector<std::string> all;
+    for (auto &s : e.scripts) for (auto &m : s.matches) convert_pattern(m, all);
+    for (auto &g : e.registered) for (auto &m : g.matches) convert_pattern(m, all);
+    if (e.has_permission("scripting") || e.has_permission("contentScripts")) convert_pattern("<all_urls>", all);
+    if (!all.empty()) {
         auto allv = to_cstrv(all);
-        std::string api = d_->polyfill(e, "content");
+        std::string api = polyfill(e, "content");
         WebKitUserScript *pf = webkit_user_script_new_for_world(api.c_str(), WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
             WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, world.c_str(), allv.data(), nullptr);
         webkit_user_content_manager_add_script(ucm, pf);
-        webkit_user_script_unref(pf);
+        ad.scripts.push_back(pf);  // reference kept so the script can be removed again
 
         for (auto &s : e.scripts) {
             std::vector<std::string> allow, block;
@@ -1952,27 +2076,88 @@ void ExtensionManager::attach_view(WebKitWebView *view, WebKitUserContentManager
             auto av = to_cstrv(allow), bv = to_cstrv(block);
             auto frames = s.all_frames ? WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES : WEBKIT_USER_CONTENT_INJECT_TOP_FRAME;
             for (auto &css : s.css) {
-                std::string text = read_file(e.dir + "/" + css);
+                std::string text = read_ext_file(e, css);
                 if (text.empty()) continue;
                 WebKitUserStyleSheet *ss = webkit_user_style_sheet_new_for_world(text.c_str(), frames, WEBKIT_USER_STYLE_LEVEL_USER, world.c_str(), av.data(), block.empty() ? nullptr : bv.data());
                 webkit_user_content_manager_add_style_sheet(ucm, ss);
-                webkit_user_style_sheet_unref(ss);
+                ad.sheets.push_back(ss);
             }
             std::string code;
-            for (auto &js : s.js) code += "\n// ---- " + js + "\n" + read_file(e.dir + "/" + js) + "\n;\n";
+            for (auto &js : s.js) code += "\n// ---- " + js + "\n" + read_ext_file(e, js) + "\n;\n";
             if (code.empty()) continue;
             auto when = s.run_at == "document_start" ? WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START : WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END;
             WebKitUserScript *us = webkit_user_script_new_for_world(code.c_str(), frames, when, world.c_str(), av.data(), block.empty() ? nullptr : bv.data());
             webkit_user_content_manager_add_script(ucm, us);
-            webkit_user_script_unref(us);
+            ad.scripts.push_back(us);
         }
-        for (auto &g : e.registered) d_->add_registered_to(e, g, ucm);
-        info.attached.push_back(&e);
+        for (auto &g : e.registered) add_registered_to(e, g, ucm);
     }
+    info.attached.push_back(&e);
+    return true;
+}
+
+void ExtensionManager::Impl::detach_ext(Ext &e, ViewInfo &info) {
+    auto it = info.added.find(&e);
+    if (it != info.added.end()) {
+        Added &ad = it->second;
+        if (ad.handler_id) g_signal_handler_disconnect(info.ucm, ad.handler_id);  // frees the MsgCtx
+        webkit_user_content_manager_unregister_script_message_handler(info.ucm, ad.handler.c_str(), ad.world.c_str());
+        for (auto *u : ad.scripts) { webkit_user_content_manager_remove_script(info.ucm, u); webkit_user_script_unref(u); }
+        for (auto *ss : ad.sheets) { webkit_user_content_manager_remove_style_sheet(info.ucm, ss); webkit_user_style_sheet_unref(ss); }
+        info.added.erase(it);
+    }
+    for (auto &g : e.registered) {
+        for (auto i = g.scripts.begin(); i != g.scripts.end();) {
+            if (i->first == info.ucm) { webkit_user_content_manager_remove_script(i->first, i->second); webkit_user_script_unref(i->second); i = g.scripts.erase(i); } else ++i;
+        }
+        for (auto i = g.sheets.begin(); i != g.sheets.end();) {
+            if (i->first == info.ucm) { webkit_user_content_manager_remove_style_sheet(i->first, i->second); webkit_user_style_sheet_unref(i->second); i = g.sheets.erase(i); } else ++i;
+        }
+    }
+    info.attached.erase(std::remove(info.attached.begin(), info.attached.end(), &e), info.attached.end());
+}
+
+void ExtensionManager::Impl::unload(Ext &e) {
+    // 1. close the extension's own pages (popup popover, options window)
+    for (WebKitWebView *v : std::vector<WebKitWebView *>(e.page_views)) {
+        GtkWidget *w = GTK_WIDGET(v);
+        if (GtkWidget *pop = gtk_widget_get_ancestor(w, GTK_TYPE_POPOVER)) gtk_popover_popdown(GTK_POPOVER(pop));
+        else if (GtkRoot *root = gtk_widget_get_root(w)) { if (GTK_IS_WINDOW(root)) gtk_window_destroy(GTK_WINDOW(root)); }
+    }
+    // 2. stop the background page
+    if (e.bg) {
+        webkit_web_view_terminate_web_process(e.bg);
+        g_object_unref(e.bg);
+        e.bg = nullptr;
+    }
+    if (e.bg_ucm) { g_object_unref(e.bg_ucm); e.bg_ucm = nullptr; }
+    e.bg_started = false; e.bg_ready = false; e.webreq_listening = false;
+    e.waiting.clear();
+    // 3. take scripts, styles, handlers and network rules out of every open tab
+    ++e.dnr_generation;  // a rules save still in flight must not re-add the filter
+    for (auto &[v, info] : views) {
+        detach_ext(e, info);
+        if (e.dnr_filter) webkit_user_content_manager_remove_filter(info.ucm, e.dnr_filter);
+        drop_ports_for(v);
+    }
+    if (e.dnr_filter) { webkit_user_content_filter_unref(e.dnr_filter); e.dnr_filter = nullptr; }
+}
+
+void ExtensionManager::Impl::activate(Ext &e) {
+    if (!e.enabled || e.removed) return;
+    load_dnr_state(e);
+    start_background(e);
+    for (auto &[v, info] : views) attach_ext(e, v, info);
+}
+
+void ExtensionManager::attach_view(WebKitWebView *view, WebKitUserContentManager *ucm, int tab_id, bool is_private) {
+    if (is_private) return;  // like Firefox, extensions do not run in private windows by default
+    Impl::ViewInfo info{ucm, tab_id, {}, {}};
+    for (auto &up : d_->exts) d_->attach_ext(*up, view, info);
     for (auto &up : d_->exts) if (up->enabled && up->dnr_filter) webkit_user_content_manager_add_filter(ucm, up->dnr_filter);
     g_object_set_data(G_OBJECT(view), "reed-tab-id", GINT_TO_POINTER(tab_id));
     g_signal_connect(view, "resource-load-started", G_CALLBACK(on_resource_started), d_.get());
-    d_->views[view] = info;
+    d_->views[view] = std::move(info);
     d_->tab_views[tab_id] = view;
 }
 
@@ -1980,31 +2165,53 @@ void ExtensionManager::detach_view(WebKitWebView *view) {
     auto it = d_->views.find(view);
     if (it == d_->views.end()) return;
     d_->tab_views.erase(it->second.tab_id);
+    for (auto &[ext, ad] : it->second.added) {  // the view's content manager goes away with it; just drop our references
+        (void)ext;
+        for (auto *u : ad.scripts) webkit_user_script_unref(u);
+        for (auto *ss : ad.sheets) webkit_user_style_sheet_unref(ss);
+    }
     d_->views.erase(it);
     d_->drop_ports_for(view);
 }
 
-static std::string tab_args(ExtensionManager::Impl *d, int id) {
-    if (d->host.list_tabs) for (auto &t : d->host.list_tabs()) if (t.id == id) return d->tab_json(t);
+static std::string tab_args(ExtensionManager::Impl *d, int id, const Ext &viewer) {
+    if (d->host.list_tabs) for (auto &t : d->host.list_tabs()) if (t.id == id) return d->tab_json(t, &viewer);
     return "{\"id\":" + std::to_string(id) + "}";
 }
-void ExtensionManager::tab_created(int id) { d_->fire_all("tabs.onCreated", "[" + tab_args(d_.get(), id) + "]"); }
-void ExtensionManager::tab_removed(int id) { d_->fire_all("tabs.onRemoved", "[" + std::to_string(id) + ",{\"windowId\":1,\"isWindowClosing\":false}]"); }
+static std::string tab_url(ExtensionManager::Impl *d, int id) {
+    if (d->host.list_tabs) for (auto &t : d->host.list_tabs()) if (t.id == id) return t.url;
+    return "";
+}
+void ExtensionManager::tab_created(int id) { d_->fire_filtered("tabs.onCreated", [&](Ext &e) { return "[" + tab_args(d_.get(), id, e) + "]"; }); }
+void ExtensionManager::tab_removed(int id) {
+    for (auto &e : d_->exts) e->active_tab_grants.erase(id);
+    d_->fire_all("tabs.onRemoved", "[" + std::to_string(id) + ",{\"windowId\":1,\"isWindowClosing\":false}]");
+}
 void ExtensionManager::tab_activated(int id) { d_->fire_all("tabs.onActivated", "[{\"tabId\":" + std::to_string(id) + ",\"windowId\":1}]"); }
+// webNavigation events carry URLs: only for extensions with the "webNavigation" permission and host access to that URL.
+static void fire_nav(ExtensionManager::Impl *d, const char *name, int id, const std::string &url, const std::string &extra) {
+    d->fire_filtered(name, [&](Ext &e) -> std::string {
+        if (!e.has_permission("webNavigation") || !e.host_allowed(url)) return "";
+        return "[{\"tabId\":" + std::to_string(id) + ",\"url\":" + quote(url) + ",\"frameId\":0,\"parentFrameId\":-1,\"processId\":-1,\"timeStamp\":" + std::to_string(g_get_real_time() / 1000) + extra + "}]";
+    });
+}
 void ExtensionManager::tab_committed(int id, const std::string &url) {
-    std::string d = "[{\"tabId\":" + std::to_string(id) + ",\"url\":" + quote(url) + ",\"frameId\":0,\"parentFrameId\":-1,\"processId\":-1,\"timeStamp\":" + std::to_string(g_get_real_time() / 1000) + ",\"transitionType\":\"link\",\"transitionQualifiers\":[]}]";
-    d_->fire_all("webNavigation.onBeforeNavigate", d);
-    d_->fire_all("webNavigation.onCommitted", d);
+    for (auto &e : d_->exts) e->active_tab_grants.erase(id);  // activeTab ends when the tab navigates
+    fire_nav(d_.get(), "webNavigation.onBeforeNavigate", id, url, "");
+    fire_nav(d_.get(), "webNavigation.onCommitted", id, url, ",\"transitionType\":\"link\",\"transitionQualifiers\":[]");
 }
 void ExtensionManager::tab_updated(int id, const std::string &status, const std::string &url, const std::string &title) {
     if (status == "complete" && !url.empty()) {
-        std::string d = "[{\"tabId\":" + std::to_string(id) + ",\"url\":" + quote(url) + ",\"frameId\":0,\"parentFrameId\":-1,\"processId\":-1,\"timeStamp\":" + std::to_string(g_get_real_time() / 1000) + "}]";
-        d_->fire_all("webNavigation.onDOMContentLoaded", d);
-        d_->fire_all("webNavigation.onCompleted", d);
+        fire_nav(d_.get(), "webNavigation.onDOMContentLoaded", id, url, "");
+        fire_nav(d_.get(), "webNavigation.onCompleted", id, url, "");
     }
     if (status == "loading") { auto tv = d_->tab_views.find(id); if (tv != d_->tab_views.end()) d_->drop_ports_for(tv->second); }  // new document: old content-script ports are gone
-    std::string change = "{\"status\":" + quote(status);
-    if (!url.empty()) change += ",\"url\":" + quote(url);
-    if (!title.empty()) change += ",\"title\":" + quote(title);
-    d_->fire_all("tabs.onUpdated", "[" + std::to_string(id) + "," + change + "}," + tab_args(d_.get(), id) + "]");
+    std::string cur = tab_url(d_.get(), id);
+    d_->fire_filtered("tabs.onUpdated", [&](Ext &e) {
+        bool see = e.has_permission("tabs") || d_->tab_access(e, id, cur.empty() ? url : cur);
+        std::string change = "{\"status\":" + quote(status);
+        if (see && !url.empty()) change += ",\"url\":" + quote(url);
+        if (see && !title.empty()) change += ",\"title\":" + quote(title);
+        return "[" + std::to_string(id) + "," + change + "}," + tab_args(d_.get(), id, e) + "]";
+    });
 }

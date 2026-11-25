@@ -9,8 +9,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install build dependencies
-        run: dnf -y install gcc-c++ cmake make pkgconf-pkg-config gtk4-devel webkitgtk6.0-devel sqlite-devel json-glib-devel libarchive-devel libcurl-devel python3
+        run: dnf -y install gcc-c++ cmake make pkgconf-pkg-config gtk4-devel webkitgtk6.0-devel xorg-x11-server-Xvfb sqlite-devel json-glib-devel libarchive-devel libcurl-devel python3
       - name: Validate source bundle
         run: python3 tools/validate-release.py
       - name: Build
         run: JOBS=2 ./build.sh
+      - name: Unit tests
+        run: WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 xvfb-run -a ctest --test-dir build --output-on-failure

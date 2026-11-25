@@ -34,7 +34,7 @@ function report(path) {
 if (ctx !== "content") {
     const send = (m) => { try { post("log", { msg: "[" + ctx + "] " + m }).catch(() => {}); } catch (_) {} };
     addEventListener("error", (ev) => send("error: " + ev.message + " (" + (ev.filename || "").split("/").slice(-2).join("/") + ":" + ev.lineno + ")"));
-    addEventListener("unhandledrejection", (ev) => send("unhandled rejection: " + (ev.reason && (ev.reason.stack || ev.reason.message) || ev.reason)));
+    addEventListener("unhandledrejection", (ev) => send("unhandled rejection: " + String(ev.reason && ev.reason.message || ev.reason) + " " + ((ev.reason && ev.reason.stack) || "")));
     const ce = console.error.bind(console);
     console.error = (...a) => { send("console.error: " + a.map((x) => (x && x.stack) || String(x)).join(" ")); ce(...a); };
 }

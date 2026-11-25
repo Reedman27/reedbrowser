@@ -19,5 +19,5 @@ The source was inspected and edited in this environment, but it was **not compil
 ## 0.5.2 customization build fix
 
 - Fixed the custom accent-color callback compile error on GCC 16 / Fedora 45. The callback now uses a dedicated `AccentApplyData` struct instead of placing a comma-containing `std::pair<...>` type inside `G_CALLBACK`, which the C preprocessor incorrectly treated as multiple macro arguments.
-- Release validation script passes all 12 checks and the source archive passes ZIP integrity validation.
+- Release validation script passes all of its checks (also run by ctest) and the source archive passes ZIP integrity validation.
 - A full GTK4/WebKitGTK build was not available in the packaging environment; Fedora runtime build remains the final verification step.

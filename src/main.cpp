@@ -912,31 +912,11 @@ static void extension_message(Browser *b, const std::string &title, const std::s
     gtk_window_set_child(GTK_WINDOW(win), box); gtk_window_present(GTK_WINDOW(win));
 }
 struct ExtAction { Browser *browser; GtkWidget *entry; };
-struct InstallConfirm { Browser *browser; std::string source; GtkWidget *window; };
-static void confirm_extension_install(GtkButton *, gpointer data) {
-    auto *c = static_cast<InstallConfirm *>(data);
-    Browser *browser = c->browser; GtkWidget *window = c->window; std::string source = c->source;
-    std::string msg; bool ok = browser->ext && browser->ext->install(source, true, &msg);
-    if (ok) browser->ext->start_new();
-    gtk_window_destroy(GTK_WINDOW(window));
-    extension_message(browser, ok ? "Extension installed" : "Installation failed", msg + (ok ? "\n\nRestart ReedBrowser to load it." : ""));
-}
+static void start_extension_install(Browser *b, WebKitWebView *origin, const std::string &source, int install_id);
 static void install_extension_clicked(GtkButton *, gpointer data) {
     auto *a = static_cast<ExtAction *>(data); const char *v = gtk_editable_get_text(GTK_EDITABLE(a->entry));
     if (!v || !*v) { extension_message(a->browser, "Install extension", "Paste an addons.mozilla.org URL or a local XPI/ZIP path."); return; }
-    GtkWidget *win = gtk_window_new(); gtk_window_set_application(GTK_WINDOW(win), a->browser->app);
-    gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(a->browser->window)); gtk_window_set_modal(GTK_WINDOW(win), TRUE);
-    gtk_window_set_title(GTK_WINDOW(win), "Confirm extension installation"); gtk_window_set_default_size(GTK_WINDOW(win), 470, 210);
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12); gtk_widget_set_margin_start(box, 18); gtk_widget_set_margin_end(box, 18); gtk_widget_set_margin_top(box, 18); gtk_widget_set_margin_bottom(box, 18);
-    GtkWidget *label = gtk_label_new("Install this extension? ReedBrowser will grant the permissions declared in its manifest. Per-site permission prompts are not implemented yet. Only install extensions you trust.");
-    gtk_label_set_wrap(GTK_LABEL(label), TRUE); gtk_widget_set_halign(label, GTK_ALIGN_START); gtk_box_append(GTK_BOX(box), label);
-    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8); gtk_widget_set_halign(row, GTK_ALIGN_END);
-    GtkWidget *cancel = gtk_button_new_with_label("Cancel"); GtkWidget *install = gtk_button_new_with_label("Install and grant permissions");
-    gtk_box_append(GTK_BOX(row), cancel); gtk_box_append(GTK_BOX(row), install); gtk_box_append(GTK_BOX(box), row);
-    auto *confirm = new InstallConfirm{a->browser, v, win};
-    g_signal_connect_data(install, "clicked", G_CALLBACK(confirm_extension_install), confirm, +[](gpointer p, GClosure*){ delete static_cast<InstallConfirm*>(p); }, GConnectFlags(0));
-    g_signal_connect_swapped(cancel, "clicked", G_CALLBACK(gtk_window_destroy), win);
-    gtk_window_set_child(GTK_WINDOW(win), box); gtk_window_present(GTK_WINDOW(win));
+    start_extension_install(a->browser, nullptr, v, -1);  // same background download + consent dialog as "Add to Firefox"
 }
 static void remove_extension_clicked(GtkButton *, gpointer data) {
     auto *a = static_cast<ExtAction *>(data); const char *v = gtk_editable_get_text(GTK_EDITABLE(a->entry));
@@ -996,7 +976,7 @@ static void show_settings(Browser *b) {
     GtkWidget *scroll=gtk_scrolled_window_new(); gtk_widget_set_vexpand(scroll,TRUE); gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scroll),170); GtkWidget *text=gtk_text_view_new(); gtk_text_view_set_editable(GTK_TEXT_VIEW(text),FALSE); gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(text),FALSE); gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(text),GTK_WRAP_WORD_CHAR); std::string list=b->ext?b->ext->describe():"Extension manager unavailable."; gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(text)),list.c_str(),-1); gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),text); gtk_box_append(GTK_BOX(exts),scroll);
     GtkWidget *il=gtk_label_new("Install from Firefox Add-ons or a local package"); gtk_widget_set_halign(il,GTK_ALIGN_START); gtk_box_append(GTK_BOX(exts),il); GtkWidget *ir=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8); GtkWidget *ie=gtk_entry_new(); gtk_widget_set_hexpand(ie,TRUE); gtk_entry_set_placeholder_text(GTK_ENTRY(ie),"AMO URL or local .xpi/.zip path"); GtkWidget *ib=gtk_button_new_with_label("Install"); auto *ia=new ExtAction{b,ie}; g_signal_connect_data(ib,"clicked",G_CALLBACK(install_extension_clicked),ia,+[](gpointer p,GClosure*){delete static_cast<ExtAction*>(p);},GConnectFlags(0)); gtk_box_append(GTK_BOX(ir),ie);gtk_box_append(GTK_BOX(ir),ib);gtk_box_append(GTK_BOX(exts),ir);
     GtkWidget *rr=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8); GtkWidget *re=gtk_entry_new(); gtk_widget_set_hexpand(re,TRUE); gtk_entry_set_placeholder_text(GTK_ENTRY(re),"Extension name or ID to remove"); GtkWidget *rb=gtk_button_new_with_label("Remove"); auto *ra=new ExtAction{b,re};g_signal_connect_data(rb,"clicked",G_CALLBACK(remove_extension_clicked),ra,+[](gpointer p,GClosure*){delete static_cast<ExtAction*>(p);},GConnectFlags(0));gtk_box_append(GTK_BOX(rr),re);gtk_box_append(GTK_BOX(rr),rb);gtk_box_append(GTK_BOX(exts),rr);
-    GtkWidget *warning=gtk_label_new("Installed extensions load after restarting. Firefox API compatibility is still evolving.");gtk_label_set_wrap(GTK_LABEL(warning),TRUE);gtk_widget_add_css_class(warning,"dim-label");gtk_widget_set_halign(warning,GTK_ALIGN_START);gtk_box_append(GTK_BOX(exts),warning);
+    GtkWidget *warning=gtk_label_new("Extensions run right after install; reload open tabs to apply content scripts. Firefox API compatibility is still evolving.");gtk_label_set_wrap(GTK_LABEL(warning),TRUE);gtk_widget_add_css_class(warning,"dim-label");gtk_widget_set_halign(warning,GTK_ALIGN_START);gtk_box_append(GTK_BOX(exts),warning);
     GtkWidget *privacy=page("Privacy"); settings_section("Privacy & security", "Privacy controls will be expanded as the underlying WebKit controls are wired up.",privacy);
     GtkWidget *about=page("About"); GtkWidget *abt=gtk_label_new("ReedBrowser");gtk_widget_add_css_class(abt,"title-1");gtk_widget_set_halign(abt,GTK_ALIGN_START);gtk_box_append(GTK_BOX(about),abt);GtkWidget *desc=gtk_label_new("A native GTK4 + WebKitGTK browser.");gtk_widget_set_halign(desc,GTK_ALIGN_START);gtk_box_append(GTK_BOX(about),desc);
     // Settings search filters navigation pages by their visible page names.
@@ -1242,7 +1222,7 @@ static void amo_event(WebKitWebView *view, int install_id, const char *event) {
 }
 
 struct InstallJob {
-    Browser *browser; GObject *view_ref; std::string source; int install_id; std::string temp; bool ok{false}; std::string error;
+    Browser *browser; GObject *view_ref; std::string source; int install_id; std::string temp; bool ok{false}; std::string error; bool local{false};
 };
 static void install_job_free(InstallJob *j) { if (j->view_ref) g_object_unref(j->view_ref); delete j; }
 
@@ -1262,18 +1242,25 @@ static void install_download_done(GObject *, GAsyncResult *, gpointer data) {
         install_job_free(j); return;
     }
     amo_event(view, j->install_id, "onDownloadEnded");
+    std::string perm_summary, perm_err;
+    if (!b->ext || !b->ext->inspect(j->temp, &perm_summary, &perm_err)) {
+        extension_message(b, "Not a valid extension", perm_err.empty() ? "The package could not be read." : perm_err);
+        if (!j->local) { std::error_code ec; std::filesystem::remove(j->temp, ec); }
+        install_job_free(j); return;
+    }
     // Consent dialog: show what it asks for before installing.
     std::string summary;
     GtkWidget *win = gtk_window_new(); gtk_window_set_application(GTK_WINDOW(win), b->app);
     gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(b->window)); gtk_window_set_modal(GTK_WINDOW(win), TRUE);
-    gtk_window_set_title(GTK_WINDOW(win), "Add extension to ReedBrowser?"); gtk_window_set_default_size(GTK_WINDOW(win), 480, 220);
+    gtk_window_set_title(GTK_WINDOW(win), "Add extension to ReedBrowser?"); gtk_window_set_default_size(GTK_WINDOW(win), 540, 440);
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     gtk_widget_set_margin_start(box, 18); gtk_widget_set_margin_end(box, 18); gtk_widget_set_margin_top(box, 18); gtk_widget_set_margin_bottom(box, 18);
-    std::string text = "Source: " + j->source + "\n\nThis extension will be given every permission its manifest declares. ReedBrowser does not show per-permission prompts yet, so only add extensions you trust.";
+    std::string text = "Source: " + j->source + "\n\nThis extension asks for:\n\n" + perm_summary + "\nOnly add extensions you trust.";
     GtkWidget *label = gtk_label_new(text.c_str()); gtk_label_set_wrap(GTK_LABEL(label), TRUE); gtk_label_set_xalign(GTK_LABEL(label), 0); gtk_label_set_selectable(GTK_LABEL(label), TRUE);
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8); gtk_widget_set_halign(row, GTK_ALIGN_END);
     GtkWidget *cancel = gtk_button_new_with_label("Cancel"); GtkWidget *add = gtk_button_new_with_label("Add extension"); gtk_widget_add_css_class(add, "suggested-action");
-    gtk_box_append(GTK_BOX(row), cancel); gtk_box_append(GTK_BOX(row), add); gtk_box_append(GTK_BOX(box), label); gtk_box_append(GTK_BOX(box), row);
+    GtkWidget *sc = gtk_scrolled_window_new(); gtk_widget_set_vexpand(sc, TRUE); gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sc), label);
+    gtk_box_append(GTK_BOX(row), cancel); gtk_box_append(GTK_BOX(row), add); gtk_box_append(GTK_BOX(box), sc); gtk_box_append(GTK_BOX(box), row);
     g_object_set_data(G_OBJECT(add), "win", win); g_object_set_data(G_OBJECT(cancel), "win", win);
     g_signal_connect_data(add, "clicked", G_CALLBACK(+[](GtkButton *, gpointer p) {
         auto *job = static_cast<InstallJob *>(p);
@@ -1295,7 +1282,7 @@ static void install_download_done(GObject *, GAsyncResult *, gpointer data) {
     g_signal_connect_swapped(cancel, "clicked", G_CALLBACK(gtk_window_destroy), win);
     g_signal_connect_data(win, "destroy", G_CALLBACK(+[](GtkWidget *, gpointer p) {
         auto *job = static_cast<InstallJob *>(p);
-        std::error_code ec; std::filesystem::remove(job->temp, ec);
+        if (!job->local) { std::error_code ec; std::filesystem::remove(job->temp, ec); }
         install_job_free(job);
     }), j, nullptr, GConnectFlags(0));
     gtk_window_set_child(GTK_WINDOW(win), box); gtk_window_present(GTK_WINDOW(win));
@@ -1304,7 +1291,12 @@ static void install_download_done(GObject *, GAsyncResult *, gpointer data) {
 
 static void start_extension_install(Browser *b, WebKitWebView *origin, const std::string &source, int install_id) {
     if (!b->ext) { extension_message(b, "Extensions unavailable", "The extension runtime is not running."); return; }
-    auto *j = new InstallJob{b, origin ? G_OBJECT(g_object_ref(origin)) : nullptr, source, install_id, "", false, ""};
+    auto *j = new InstallJob{b, origin ? G_OBJECT(g_object_ref(origin)) : nullptr, source, install_id, "", false, "", false};
+    if (std::filesystem::exists(source)) {  // a local XPI/ZIP/folder: nothing to download
+        j->temp = source; j->local = true; j->ok = true;
+        install_download_done(nullptr, nullptr, j);
+        return;
+    }
     j->temp = b->data_dir + "/web-install-" + std::to_string(g_get_monotonic_time()) + ".xpi";
     set_status(b, "Downloading extension…");
     amo_event(origin, install_id, "onDownloadStarted");
@@ -1561,7 +1553,7 @@ static void ext_manager_populate(Browser *b, GtkWidget *list) {
     for (auto &it : items) {
         GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
         GtkWidget *label = gtk_label_new((it.name + "  " + it.version).c_str()); gtk_widget_set_hexpand(label, TRUE); gtk_widget_set_halign(label, GTK_ALIGN_START);
-        GtkWidget *sw = gtk_switch_new(); gtk_switch_set_active(GTK_SWITCH(sw), it.enabled); gtk_widget_set_valign(sw, GTK_ALIGN_CENTER); gtk_widget_set_tooltip_text(sw, "Enabled (content scripts change after restart)");
+        GtkWidget *sw = gtk_switch_new(); gtk_switch_set_active(GTK_SWITCH(sw), it.enabled); gtk_widget_set_valign(sw, GTK_ALIGN_CENTER); gtk_widget_set_tooltip_text(sw, "Enabled (turning it off stops the extension immediately)");
         GtkWidget *opt = gtk_button_new_with_label("Options"); gtk_widget_set_sensitive(opt, it.has_options);
         GtkWidget *rm = gtk_button_new_with_label("Remove");
         g_signal_connect_data(sw, "state-set", G_CALLBACK(+[](GtkSwitch *, gboolean st, gpointer d) -> gboolean {
@@ -1573,7 +1565,7 @@ static void ext_manager_populate(Browser *b, GtkWidget *list) {
         g_signal_connect_data(rm, "clicked", G_CALLBACK(+[](GtkButton *bt, gpointer d) {
             auto *c = static_cast<ExtRowCtx *>(d);
             std::string msg; bool ok = c->browser->ext->remove(c->uuid, &msg);
-            set_status(c->browser, ok ? "Extension removed. Restart ReedBrowser to finish unloading it." : "Could not remove extension.");
+            set_status(c->browser, ok ? "Extension removed." : "Could not remove extension.");
             ext_manager_populate(c->browser, GTK_WIDGET(g_object_get_data(G_OBJECT(bt), "list")));
             refresh_extension_buttons(c->browser);
         }), new ExtRowCtx{b, it.uuid}, +[](gpointer p, GClosure *) { delete static_cast<ExtRowCtx *>(p); }, GConnectFlags(0));

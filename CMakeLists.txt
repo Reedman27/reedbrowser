@@ -30,5 +30,17 @@ target_link_libraries(reedbrowser PRIVATE PkgConfig::GTK4 PkgConfig::WEBKIT PkgC
 target_compile_options(reedbrowser PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 target_compile_definitions(reedbrowser PRIVATE REEDBROWSER_VERSION="${PROJECT_VERSION}" REEDBROWSER_EXT_VERSION="${PROJECT_VERSION}")
 
+# Unit tests (ctest). Both are standalone programs; the DNR one also asks WebKit to compile the rules.
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(test-dnr tools/test-dnr.cpp)
+  target_include_directories(test-dnr PRIVATE src)
+  target_link_libraries(test-dnr PRIVATE PkgConfig::WEBKIT PkgConfig::JSONGLIB)
+  add_test(NAME release-validation COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/validate-release.py WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME dnr-conversion COMMAND test-dnr)
+  # tools/test-importer.cpp needs sample Chromium/Firefox/HTML bookmark files passed as argv[1]; not registered yet.
+endif()
+
 install(TARGETS reedbrowser RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES README.md LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/reedbrowser)
+install(FILES packaging/reedbrowser.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)

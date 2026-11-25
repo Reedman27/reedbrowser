@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ReedBrowser
+GenericName=Web Browser
+Comment=GTK4 + WebKitGTK browser with Firefox extension support
+Exec=reedbrowser %U
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
+StartupNotify=true

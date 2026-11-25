@@ -1,4 +1,5 @@
 // Build: g++ -std=c++17 -Isrc tools/test-importer.cpp $(pkg-config --cflags --libs json-glib-1.0 sqlite3) -o /tmp/test-importer
+#undef NDEBUG  // the checks below have side effects and must run in Release builds
 #include "../src/importer.hpp"
 #include <cassert>
 #include <cstdio>
