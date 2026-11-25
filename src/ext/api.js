@@ -339,8 +339,29 @@ const cookies = wrapAll({
 });
 cookies.onChanged = inertEv("cookies.onChanged");
 
-const menus = wrapAll({ create: () => 1, update: () => undefined, remove: () => undefined, removeAll: () => undefined, refresh: () => undefined });
-menus.onClicked = inertEv("menus.onClicked");
+const menus = wrapAll({
+    update: (id, props) => post("menus.update", { id: String(id), props: props || {} }),
+    remove: (id) => post("menus.remove", { id: String(id) }),
+    removeAll: () => post("menus.removeAll", {}),
+    refresh: () => undefined,
+});
+let menuSeq = 0;
+const menuClicks = new Map();
+// create() returns the id synchronously (Firefox behaviour) and reports errors through the callback.
+menus.create = (props, cb) => {
+    const p = Object.assign({}, props);
+    const id = p.id !== undefined ? p.id : "reedmenu" + (++menuSeq);
+    p.id = String(id);
+    if (typeof p.onclick === "function") menuClicks.set(p.id, p.onclick);
+    delete p.onclick;
+    post("menus.create", { props: p }).then(() => { if (cb) cb(); }, (e) => {
+        runtime.lastError = { message: String((e && e.message) || e) };
+        try { if (cb) cb(); } finally { runtime.lastError = undefined; }
+    });
+    return id;
+};
+menus.onClicked = ev("menus.onClicked");
+menus.onClicked.addListener((info, tab) => { const f = menuClicks.get(String(info.menuItemId)); if (f) { try { f(info, tab); } catch (e) { console.error(e); } } });
 menus.onShown = inertEv("menus.onShown");
 menus.onHidden = inertEv("menus.onHidden");
 

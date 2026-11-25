@@ -66,6 +66,13 @@ public:
     void start_new();                                    // start extensions installed while running
     void set_enabled(const std::string &uuid, bool on);  // content scripts follow after a restart
 
+    // Extension entries for the page context menu (menus.create / contextMenus.create).
+    struct MenuItem { std::string uuid, ext_name, id, title, parent, type; bool enabled = true, checked = false; };
+    struct MenuClick { std::string menu_id, page_url, link_url, src_url, selection, media_type; bool editable = false, checked = false; };
+    // `contexts` holds what was right-clicked: page, link, image, video, audio, selection, editable, frame.
+    std::vector<MenuItem> context_menu_items(const std::vector<std::string> &contexts) const;
+    void context_menu_clicked(const std::string &uuid, const MenuClick &click, int tab_id);
+
     struct Impl;
 private:
     std::unique_ptr<Impl> d_;

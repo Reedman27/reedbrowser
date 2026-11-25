@@ -235,6 +235,97 @@ static std::string homepage_html(Browser *b, bool private_mode) {
     return html;
 }
 
+
+// ---- extension entries in the page context menu -------------------------------
+struct MenuClickData {
+    Browser *browser; int tab_id; WebKitWebView *view;
+    ExtensionManager::MenuClick click; std::string uuid;
+};
+static void menu_selection_done(GObject *src, GAsyncResult *res, gpointer ud) {
+    std::unique_ptr<MenuClickData> d(static_cast<MenuClickData *>(ud));
+    if (JSCValue *v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(src), res, nullptr)) {
+        if (jsc_value_is_string(v)) { char *t = jsc_value_to_string(v); d->click.selection = t ? t : ""; g_free(t); }
+        g_object_unref(v);
+    }
+    if (d->browser->ext) d->browser->ext->context_menu_clicked(d->uuid, d->click, d->tab_id);
+}
+static void on_ext_menu_activate(GSimpleAction *, GVariant *, gpointer ud) {
+    auto *src = static_cast<MenuClickData *>(ud);
+    auto *d = new MenuClickData(*src);
+    webkit_web_view_evaluate_javascript(d->view, "String(window.getSelection())", -1, nullptr, nullptr, nullptr, menu_selection_done, d);
+}
+static gboolean on_tab_context_menu(WebKitWebView *view, WebKitContextMenu *menu, WebKitHitTestResult *hit, gpointer data) {
+    Tab *tab = static_cast<Tab *>(data);
+    Browser *b = tab->browser;
+    if (!b->ext || b->ext->extension_count() == 0) return FALSE;
+    std::vector<std::string> ctx;
+    bool other = false;
+    if (webkit_hit_test_result_context_is_link(hit)) { ctx.push_back("link"); other = true; }
+    if (webkit_hit_test_result_context_is_image(hit)) { ctx.push_back("image"); other = true; }
+    if (webkit_hit_test_result_context_is_media(hit)) { ctx.push_back("video"); ctx.push_back("audio"); other = true; }
+    if (webkit_hit_test_result_context_is_selection(hit)) { ctx.push_back("selection"); other = true; }
+    if (webkit_hit_test_result_context_is_editable(hit)) { ctx.push_back("editable"); other = true; }
+    if (!other) ctx.push_back("page");
+    auto items = b->ext->context_menu_items(ctx);
+    if (items.empty()) return FALSE;
+
+    const char *uri = webkit_web_view_get_uri(view);
+    ExtensionManager::MenuClick base;
+    base.page_url = uri ? uri : "";
+    base.editable = webkit_hit_test_result_context_is_editable(hit);
+    if (webkit_hit_test_result_context_is_link(hit)) { const char *l = webkit_hit_test_result_get_link_uri(hit); base.link_url = l ? l : ""; }
+    if (webkit_hit_test_result_context_is_image(hit) || webkit_hit_test_result_context_is_media(hit)) {
+        const char *m = webkit_hit_test_result_get_media_uri(hit);
+        if (!m && webkit_hit_test_result_context_is_image(hit)) m = webkit_hit_test_result_get_image_uri(hit);
+        base.src_url = m ? m : "";
+        base.media_type = webkit_hit_test_result_context_is_image(hit) ? "image" : "video";
+    }
+    webkit_context_menu_append(menu, webkit_context_menu_item_new_separator());
+    int counter = 0;
+    auto make_item = [&](const ExtensionManager::MenuItem &it, WebKitContextMenu *into, const std::string &prefix) -> WebKitContextMenuItem * {
+        if (it.type == "separator") return webkit_context_menu_item_new_separator();
+        std::string label = it.title.empty() ? it.id : it.title;
+        std::string sel = base.selection;
+        size_t pos = label.find("%s");
+        if (pos != std::string::npos) label.replace(pos, 2, "…");
+        auto *d = new MenuClickData{b, tab->id, view, base, it.uuid};
+        d->click.menu_id = it.id;
+        std::string name = "extmenu" + std::to_string(counter++);
+        GSimpleAction *action = g_simple_action_new(name.c_str(), nullptr);
+        g_signal_connect_data(action, "activate", G_CALLBACK(on_ext_menu_activate), d, +[](gpointer p, GClosure *) { delete static_cast<MenuClickData *>(p); }, GConnectFlags(0));
+        g_simple_action_set_enabled(action, it.enabled);
+        WebKitContextMenuItem *item = webkit_context_menu_item_new_from_gaction(G_ACTION(action), label.c_str(), nullptr);
+        g_object_set_data_full(G_OBJECT(into), ("reed-act-" + prefix + name).c_str(), action, g_object_unref);
+        return item;
+    };
+    // Group each extension's entries: top-level items first, children under their parent as a submenu.
+    std::vector<std::string> order;
+    for (auto &it : items) if (std::find(order.begin(), order.end(), it.uuid) == order.end()) order.push_back(it.uuid);
+    for (auto &uuid : order) {
+        std::vector<ExtensionManager::MenuItem> mine;
+        for (auto &it : items) if (it.uuid == uuid) mine.push_back(it);
+        std::vector<ExtensionManager::MenuItem> top;
+        for (auto &it : mine) { bool has_parent = false; for (auto &o : mine) if (o.id == it.parent) has_parent = true; if (!has_parent) top.push_back(it); }
+        std::function<WebKitContextMenuItem *(const ExtensionManager::MenuItem &, WebKitContextMenu *)> build;
+        build = [&](const ExtensionManager::MenuItem &it, WebKitContextMenu *into) -> WebKitContextMenuItem * {
+            std::vector<ExtensionManager::MenuItem> kids;
+            for (auto &k : mine) if (k.parent == it.id) kids.push_back(k);
+            if (kids.empty()) return make_item(it, into, uuid);
+            WebKitContextMenu *sub = webkit_context_menu_new();
+            for (auto &k : kids) webkit_context_menu_append(sub, build(k, sub));
+            return webkit_context_menu_item_new_with_submenu((it.title.empty() ? it.id : it.title).c_str(), sub);
+        };
+        if (top.size() == 1) {
+            webkit_context_menu_append(menu, build(top[0], menu));
+        } else {
+            WebKitContextMenu *sub = webkit_context_menu_new();
+            for (auto &it : top) webkit_context_menu_append(sub, build(it, sub));
+            webkit_context_menu_append(menu, webkit_context_menu_item_new_with_submenu(mine[0].ext_name.c_str(), sub));
+        }
+    }
+    return FALSE;
+}
+
 static void load_home(Tab *tab) {
     std::string html = homepage_html(tab->browser, tab->private_mode);
     webkit_web_view_load_html(tab->view, html.c_str(), nullptr);
@@ -559,6 +650,7 @@ static WebKitWebView *create_tab(Browser *b, bool private_mode, const std::strin
         nullptr));
     g_object_unref(settings);
     if (b->ext) b->ext->attach_view(tab->view, tab->content_manager, tab->id, private_mode);
+    g_signal_connect(tab->view, "context-menu", G_CALLBACK(on_tab_context_menu), tab);
     if (!private_mode) attach_amo_support(b, tab->view, tab->content_manager);
     g_object_unref(tab->content_manager);
     gtk_widget_set_hexpand(GTK_WIDGET(tab->view), TRUE);

@@ -3,7 +3,7 @@ const set = (k, v) => (chain = chain.then(() => browser.storage.local.get("r")).
 browser.runtime.onMessage.addListener((m, sender) => {
   if (m.type === "ping") return Promise.resolve({ pong: m.n, fromTab: !!sender.tab });
   if (m.type === "results") { for (const [k, v] of Object.entries(m.data)) set(k, v); return Promise.resolve(true); }
-  if (m.type === "popup") { set("popup_msg", "ok"); return Promise.resolve({ hello: "popup" }); }
+  if (m.type === "popup") { set("popup_msg", "ok"); setTimeout(() => browser.runtime.sendMessage({ type: "to-popup" }).then((r) => set("bg_to_popup", r), (e) => set("bg_to_popup", "ERR " + e.message)), 300); return Promise.resolve({ hello: "popup" }); }
 });
 browser.runtime.onConnect.addListener((port) => {
   port.onMessage.addListener((d) => { set("port_" + port.name, d); port.postMessage({ echo: d }); });
@@ -50,3 +50,6 @@ const seen = [];
 browser.webRequest.onBeforeRequest.addListener((d) => { seen.push(d.type + ":" + d.url.split("/").pop()); }, { urls: ["http://127.0.0.1/*"] });
 browser.webRequest.onCompleted.addListener((d) => { if (d.url.endsWith("index.html") || d.url.endsWith(":8099/")) set("webreq_completed_status", d.statusCode); }, { urls: ["<all_urls>"] });
 setTimeout(() => set("webreq_seen", seen.slice(0, 8)), 4000);
+// context menu: one top-level item for pages, one for links (shown as a submenu under the extension name)
+browser.menus.create({ id: "reed-say-hi", title: "Reed test: say hi", contexts: ["page", "selection"] });
+browser.menus.onClicked.addListener((info, tab) => { set("menu_clicked", { id: info.menuItemId, page: info.pageUrl, tab: !!(tab && tab.id) }); });

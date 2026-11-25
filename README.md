@@ -29,9 +29,9 @@ ReedBrowser has its own WebExtensions runtime on top of WebKitGTK. Install from 
     reedbrowser --list-extensions
     reedbrowser --remove-extension <id-or-name>
 
-Working today: background pages and scripts, content scripts and CSS, popups, options pages and toolbar buttons, `runtime` messaging and ports, `storage`, `tabs`, `scripting`, `declarativeNetRequest` (static and dynamic rules), `cookies`, `webNavigation`, observe-only `webRequest`, `i18n` and `alarms`.
+Working today: background pages and scripts, content scripts and CSS, popups, options pages and toolbar buttons, `runtime` messaging and ports, `storage`, `tabs`, `scripting`, `declarativeNetRequest` (static and dynamic rules), `cookies`, `webNavigation`, page context menus (`menus`/`contextMenus`), observe-only `webRequest`, `i18n` and `alarms`.
 
-Not supported: blocking `webRequest` (so uBlock Origin's older Manifest V2 build cannot block; use **uBlock Origin Lite**), native messaging, extension context menus and keyboard commands, and per-permission prompts. Nothing here is guaranteed to work with every add-on; Proton Pass in particular is untested. Details are in [docs/EXTENSIONS.md](docs/EXTENSIONS.md).
+Not supported: blocking `webRequest` (so uBlock Origin's older Manifest V2 build cannot block; use **uBlock Origin Lite**), native messaging, extension keyboard commands, and per-permission prompts. Nothing here is guaranteed to work with every add-on; Proton Pass in particular is untested. Details are in [docs/EXTENSIONS.md](docs/EXTENSIONS.md).
 
 ## Implemented in this source build
 

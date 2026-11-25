@@ -21,11 +21,11 @@ Rules are converted to WebKit content rule lists (`src/dnr.hpp`). Supported: blo
 
 ## Not supported yet
 1. **webRequestBlocking, header and redirect events** — WebKitGTK has no synchronous request hook, so listeners that block or rewrite requests have no effect (request types are guessed from the URL). **uBlock Origin (MV2, the default AMO listing) installs but cannot block.** Use **uBlock Origin Lite** (MV3, declarativeNetRequest) instead, or ReedBrowser's own blocker. Full uBO would need a WebKit web-process extension.
-2. `filterResponseData`, `dns`, native messaging (`connectNative`/`sendNativeMessage`), `cookies.onChanged`, sub-frame `webNavigation` events, context menus, commands/shortcuts, notifications.
+2. `filterResponseData`, `dns`, native messaging (`connectNative`/`sendNativeMessage`), `cookies.onChanged`, sub-frame `webNavigation` events, commands/shortcuts, notifications.
 3. Per-site permission prompts, optional permissions, extension auto-update. All manifest permissions are granted at install.
-4. Messages from the background page to a popup/options page (`runtime.sendMessage` goes only to the background). Ports work in both directions.
+4. Popup/options pages can message the background and the background can message open popup/options pages. Page-to-page messages (popup to options) are not delivered.
 5. scripting `allFrames`/frame targeting: injection is top frame only. MV3 service-worker lifecycle: the background runs as a persistent page.
-6. **Proton Pass**: popup, options, ports, scripting, and storage are now in place, but it also uses APIs listed above (`webRequest` observation and context menus may be among them). Untested with the real extension.
+6. **Proton Pass**: popup, options, ports, scripting, storage and context menus are now in place, but it may use other APIs listed above. Untested with the real extension.
 
 ## Tested
-`tests/extension/` (MV2 basics) and `tests/extension-mv3/` (popup, options, ports both ways, scripting.executeScript, tabs.executeScript, insertCSS, registerContentScripts, static + dynamic declarativeNetRequest blocking, badge) under Xvfb on Ubuntu with WebKitGTK 2.52. Run the MV3 one with the files in `tests/extension-mv3/site/` served on 127.0.0.1:8099. Not tested on Fedora 45 or with real store extensions.
+`tests/extension/` (MV2 basics) and `tests/extension-mv3/` (popup, options, ports both ways, scripting.executeScript, tabs.executeScript, insertCSS, registerContentScripts, static + dynamic declarativeNetRequest blocking, badge, background-to-popup messages, page context-menu items) under Xvfb on Ubuntu with WebKitGTK 2.52. Run the MV3 one with the files in `tests/extension-mv3/site/` served on 127.0.0.1:8099. Not tested on Fedora 45 or with real store extensions.

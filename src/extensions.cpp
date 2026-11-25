@@ -159,6 +159,9 @@ struct Ext {
     WebKitUserContentManager *bg_ucm = nullptr;
     bool bg_started = false;
     bool bg_ready = false;
+    struct MenuRec { std::string id, title, parent, type = "normal"; std::vector<std::string> contexts{"page"}; bool enabled = true, visible = true, checked = false; };
+    std::vector<MenuRec> menus;
+    std::vector<WebKitWebView *> page_views;  // open popup / options pages (targets for background -> page messages)
     std::vector<std::function<void()>> waiting;  // messages sent before the background page finished loading
 
     // toolbar action / extension pages
@@ -947,7 +950,23 @@ void ExtensionManager::Impl::dispatch(MsgCtx *c, const std::string &op, JsonObje
     if (op.rfind("storage.", 0) == 0) { storage_op(e, op, args, r); return; }
 
     if (op == "runtime.sendMessage") {
-        if (!e.bg || (is_bg && !c->page)) { respond_ok(r, "{\"noReceiver\":true}"); return; }
+        if (is_bg && !c->page) {
+            // background -> popup/options pages: the first page that answers wins
+            std::string payload = "[" + dump(member(args, "message")) + "," + sender_json(c, sender_url, top) + "]";
+            auto views = std::make_shared<std::vector<WebKitWebView *>>(e.page_views);
+            auto step = std::make_shared<std::function<void(size_t)>>();
+            *step = [this, views, step, payload, r](size_t i) {
+                if (i >= views->size()) { respond_ok(r, "{\"noReceiver\":true}"); return; }
+                run_js((*views)[i], "", "const a = JSON.parse(p); return await window.__reedDeliver(a[0], a[1]);", payload,
+                       [this, step, r, i](bool ok, const std::string &j) {
+                           if (ok && j.find("\"responded\":true") != std::string::npos) { respond_ok(r, j); return; }
+                           (*step)(i + 1);
+                       });
+            };
+            (*step)(0);
+            return;
+        }
+        if (!e.bg) { respond_ok(r, "{\"noReceiver\":true}"); return; }
         if (!e.bg_ready) {
             std::string args_copy = "{}";
             if (args) { Json tmp(json_node_alloc()); json_node_init_object(tmp.n, args); args_copy = dump(tmp.n); }
@@ -1143,6 +1162,16 @@ WebKitWebView *ExtensionManager::Impl::make_page_view(Ext &e, const char *ctx) {
     g_object_unref(settings);
     g_object_unref(ucm);
     mc->view = view;
+    e.page_views.push_back(view);
+    {
+        struct Gone { Ext *e; };
+        g_object_weak_ref(G_OBJECT(view), +[](gpointer d, GObject *obj) {
+            auto *g = static_cast<Gone *>(d);
+            auto &v = g->e->page_views;
+            v.erase(std::remove(v.begin(), v.end(), reinterpret_cast<WebKitWebView *>(obj)), v.end());
+            delete g;
+        }, new Gone{&e});
+    }
     const char *allow[] = {"http://*/*", "https://*/*", nullptr};
     webkit_web_view_set_cors_allowlist(view, allow);
 
@@ -1514,6 +1543,40 @@ bool ExtensionManager::Impl::dispatch_extra(MsgCtx *c, const std::string &op, Js
     const std::string world = "reed-ext-" + e.uuid;
 
     // ---- ports (runtime.connect / tabs.connect)
+    if (op.rfind("menus.", 0) == 0) {
+        auto apply = [](Ext::MenuRec &m, JsonObject *p) {
+            if (member(p, "title")) m.title = str_of(p, "title");
+            if (member(p, "type")) m.type = str_of(p, "type", "normal");
+            if (member(p, "parentId")) m.parent = str_of(p, "parentId");
+            if (member(p, "enabled")) m.enabled = bool_of(p, "enabled", true);
+            if (member(p, "visible")) m.visible = bool_of(p, "visible", true);
+            if (member(p, "checked")) m.checked = bool_of(p, "checked", false);
+            if (JsonArray *a = arr_of(p, "contexts")) {
+                m.contexts.clear();
+                for (guint i = 0; i < json_array_get_length(a); i++) m.contexts.push_back(json_array_get_string_element(a, i));
+            }
+        };
+        if (op == "menus.create") {
+            JsonObject *p = json_node_get_object(member(args, "props"));
+            std::string id = str_of(p, "id");
+            for (auto &m : e.menus) if (m.id == id) { respond_err(r, "ID already exists: " + id); return true; }
+            Ext::MenuRec m; m.id = id; apply(m, p);
+            e.menus.push_back(m);
+        } else if (op == "menus.update") {
+            std::string id = str_of(args, "id");
+            JsonObject *p = json_node_get_object(member(args, "props"));
+            bool found = false;
+            for (auto &m : e.menus) if (m.id == id) { apply(m, p); found = true; }
+            if (!found) { respond_err(r, "Cannot find menu item with id " + id); return true; }
+        } else if (op == "menus.remove") {
+            std::string id = str_of(args, "id");
+            e.menus.erase(std::remove_if(e.menus.begin(), e.menus.end(), [&](const Ext::MenuRec &m) { return m.id == id || m.parent == id; }), e.menus.end());
+        } else if (op == "menus.removeAll") {
+            e.menus.clear();
+        } else { respond_err(r, "unknown " + op); return true; }
+        respond_ok(r, "null");
+        return true;
+    }
     if (op == "webreq.listen") { e.webreq_listening = true; respond_ok(r, "null"); return true; }
     if (op == "port.connect") {
         std::string id = str_of(args, "id"), name = str_of(args, "name");
@@ -1729,6 +1792,46 @@ static std::string details_string(const Ext &e, const char *key, const char *fie
     Json j = parse(it->second);
     if (JsonObject *o = j.obj()) return str_of(o, field);
     return "";
+}
+
+std::vector<ExtensionManager::MenuItem> ExtensionManager::context_menu_items(const std::vector<std::string> &contexts) const {
+    std::vector<MenuItem> out;
+    auto hit = [&](const Ext::MenuRec &m) {
+        if (!m.visible) return false;
+        for (auto &c : m.contexts) {
+            if (c == "all") return true;
+            if (std::find(contexts.begin(), contexts.end(), c) != contexts.end()) return true;
+        }
+        return false;
+    };
+    for (auto &e : d_->exts) {
+        if (!e->enabled) continue;
+        for (auto &m : e->menus) {
+            bool show = hit(m);
+            if (!show && m.type != "separator")
+                for (auto &k : e->menus) if (k.parent == m.id && hit(k)) { show = true; break; }  // container with a matching child
+            if (m.parent.size() && !hit(m)) show = false;
+            if (!show) continue;
+            out.push_back(MenuItem{e->uuid, e->name, m.id, m.title, m.parent, m.type, m.enabled, m.checked});
+        }
+    }
+    return out;
+}
+
+void ExtensionManager::context_menu_clicked(const std::string &uuid, const MenuClick &c, int tab_id) {
+    Ext *e = d_->by_uuid(uuid);
+    if (!e || !e->bg) return;
+    std::string info = "{\"menuItemId\":" + quote(c.menu_id) + ",\"pageUrl\":" + quote(c.page_url) + ",\"editable\":" + (c.editable ? "true" : "false");
+    if (!c.link_url.empty()) info += ",\"linkUrl\":" + quote(c.link_url);
+    if (!c.src_url.empty()) info += ",\"srcUrl\":" + quote(c.src_url);
+    if (!c.media_type.empty()) info += ",\"mediaType\":" + quote(c.media_type);
+    if (!c.selection.empty()) info += ",\"selectionText\":" + quote(c.selection);
+    for (auto &m : e->menus) if (m.id == c.menu_id && (m.type == "checkbox" || m.type == "radio")) info += std::string(",\"wasChecked\":") + (m.checked ? "true" : "false") + ",\"checked\":" + (c.checked ? "true" : "false");
+    info += "}";
+    std::string tab = "{\"id\":" + std::to_string(tab_id) + "}";
+    if (d_->host.list_tabs) for (auto &t : d_->host.list_tabs()) if (t.id == tab_id) tab = d_->tab_json(t);
+    d_->fire(*e, "menus.onClicked", "[" + info + "," + tab + "]", false);
+    for (auto &m : e->menus) if (m.id == c.menu_id && (m.type == "checkbox" || m.type == "radio")) m.checked = c.checked;
 }
 
 std::vector<ExtensionManager::ActionInfo> ExtensionManager::actions() const {
