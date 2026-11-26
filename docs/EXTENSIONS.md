@@ -39,3 +39,13 @@ Rules are converted to WebKit content rule lists (`src/dnr.hpp`). Supported: blo
 - `optional_permissions` are never granted (`permissions.request()` declines).
 - Disabling or removing an extension stops its background page, closes its popup/options pages and removes its scripts, styles, handlers and network rules from open tabs immediately. Installing attaches to open tabs without a restart.
 - Every file path named by a manifest or by `scripting.*` goes through one resolver that rejects `..`, absolute paths and symlinks leaving the extension directory.
+
+## Ad & tracker blocking (native)
+
+uBlock Origin's own engine cannot run on WebKitGTK (no synchronous request interception), so ReedBrowser
+blocks natively: `src/filters.cpp` downloads EasyList, EasyPrivacy and the uBlock filter lists (Settings >
+Privacy), `src/abp.hpp` converts Adblock Plus/uBlock syntax into WebKit content rules (network filters,
+exceptions, element hiding, `$third-party`, `$domain=`, resource types, `$badfilter`, ...), and WebKit compiles
+them. Compiled rules are cached on disk; lists refresh every few days. "My filters" accepts your own rules,
+and the main menu can switch blocking off for the current site. Not supported: `$redirect`, `$removeparam`,
+`$csp`, procedural cosmetics (`:has-text` ...), HTML filtering.

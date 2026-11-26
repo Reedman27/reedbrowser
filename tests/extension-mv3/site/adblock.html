@@ -1,0 +1,21 @@
+<!doctype html><meta charset=utf-8><title>adblock test</title>
+<body style="font:14px monospace"><h3>Ad blocking self-test</h3><pre id=o>running…</pre>
+<ins class="adsbygoogle" id="ins1" style="display:block;width:300px;height:100px;background:#fa0">AD SLOT (should be hidden)</ins>
+<div id="ad-banner" class="ad-banner" style="width:300px;height:50px;background:#f55">GENERIC BANNER</div>
+<p id=keep style="background:#8f8">Normal content (must stay visible)</p>
+<script>
+const out=[];
+const load=(name,src)=>new Promise(r=>{const s=document.createElement('script');s.onload=()=>{out.push('LOADED  '+name);r()};s.onerror=()=>{out.push('BLOCKED '+name);r()};s.src=src;document.head.appendChild(s);setTimeout(()=>{out.push('timeout '+name);r()},4000)});
+(async()=>{
+  await load('googlesyndication adsbygoogle.js','https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js');
+  await load('doubleclick','https://securepubads.g.doubleclick.net/tag/js/gpt.js');
+  await load('google-analytics','https://www.google-analytics.com/analytics.js');
+  await load('scorecardresearch beacon','https://sb.scorecardresearch.com/beacon.js');
+  await load('first-party control (must load)','/tests/adblock-control.js');
+  const vis=id=>{const e=document.getElementById(id);return getComputedStyle(e).display!=='none'&&e.offsetHeight>0};
+  out.push((vis('ins1')?'VISIBLE ':'HIDDEN  ')+'ins.adsbygoogle');
+  out.push((vis('ad-banner')?'VISIBLE ':'HIDDEN  ')+'div.ad-banner');
+  out.push((vis('keep')?'VISIBLE ':'HIDDEN  ')+'normal paragraph');
+  document.getElementById('o').textContent=out.join('\n');
+})();
+</script>

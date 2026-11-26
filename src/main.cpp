@@ -21,6 +21,7 @@
 
 #include "store.hpp"
 #include "extensions.hpp"
+#include "filters.hpp"
 #include "importer.hpp"
 
 #ifndef REEDBROWSER_VERSION
@@ -42,6 +43,7 @@ struct Tab {
     bool needs_load{false};
     std::string title{"New tab"};
     std::string uri;
+    std::vector<WebKitUserContentFilter *> list_filters;  // ad-blocking lists currently attached to this tab
 };
 
 struct Browser {
@@ -66,6 +68,7 @@ struct Browser {
     WebKitUserContentFilter *content_filter{};
     Store store;
     std::unique_ptr<ExtensionManager> ext;
+    std::unique_ptr<FilterManager> filters;
     int next_tab_id{1};
     std::vector<std::unique_ptr<Tab>> tabs;
     std::unordered_map<WebKitDownload *, std::string> downloads;
@@ -108,6 +111,25 @@ static std::string home_path(const char *leaf) {
 static void set_status(Browser *b, const std::string &s) {
     if (b->status) gtk_label_set_text(GTK_LABEL(b->status), s.c_str());
 }
+
+// ---- ad / tracker blocking lists (FilterManager) -------------------------------------------------
+static std::string host_of(const std::string &uri) {
+    GUri *g = g_uri_parse(uri.c_str(), G_URI_FLAGS_PARSE_RELAXED, nullptr);
+    std::string h = g && g_uri_get_host(g) ? g_uri_get_host(g) : "";
+    if (g) g_uri_unref(g);
+    return h;
+}
+static void detach_lists(Tab *tab) {
+    for (auto *f : tab->list_filters) webkit_user_content_manager_remove_filter(tab->content_manager, f);
+    tab->list_filters.clear();
+}
+// Attach the lists unless the user turned blocking off for `host`.
+static void apply_lists(Browser *b, Tab *tab, const std::string &host) {
+    detach_lists(tab);
+    if (!b->filters || b->filters->blocking_off(host)) return;
+    for (auto *f : b->filters->filters()) { webkit_user_content_manager_add_filter(tab->content_manager, f); tab->list_filters.push_back(f); }
+}
+static void toggle_site_blocking(Browser *b);
 
 static std::string html_escape(const std::string &s) {
     std::string out;
@@ -482,6 +504,21 @@ static void start_content_filter(Browser *b) {
     g_bytes_unref(source);
 }
 
+static void start_filter_lists(Browser *b) {
+    Browser *bp = b;
+    b->filters = std::make_unique<FilterManager>(b->data_dir,
+        [bp](const std::string &k) { return bp->store.meta(k); },
+        [bp](const std::string &k, const std::string &v) { bp->store.set_meta(k, v); });
+    b->filters->on_status = [bp](const std::string &m) { set_status(bp, m); };
+    b->filters->on_changed = [bp]() {
+        for (auto &tab : bp->tabs) {
+            const char *u = webkit_web_view_get_uri(tab->view);
+            apply_lists(bp, tab.get(), host_of(u ? u : ""));
+        }
+    };
+    b->filters->start();
+}
+
 static void on_title_changed(GObject *object, GParamSpec *, gpointer data) {
     Tab *tab = static_cast<Tab *>(data);
     const char *title = webkit_web_view_get_title(WEBKIT_WEB_VIEW(object));
@@ -643,6 +680,7 @@ static WebKitWebView *create_tab(Browser *b, bool private_mode, const std::strin
     webkit_settings_set_enable_developer_extras(settings, FALSE);
     tab->content_manager = webkit_user_content_manager_new();
     if (b->content_filter) webkit_user_content_manager_add_filter(tab->content_manager, b->content_filter);
+    apply_lists(b, tab, "");
     tab->view = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
         "network-session", tab->session,
         "settings", settings,
@@ -977,7 +1015,39 @@ static void show_settings(Browser *b) {
     GtkWidget *il=gtk_label_new("Install from Firefox Add-ons or a local package"); gtk_widget_set_halign(il,GTK_ALIGN_START); gtk_box_append(GTK_BOX(exts),il); GtkWidget *ir=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8); GtkWidget *ie=gtk_entry_new(); gtk_widget_set_hexpand(ie,TRUE); gtk_entry_set_placeholder_text(GTK_ENTRY(ie),"AMO URL or local .xpi/.zip path"); GtkWidget *ib=gtk_button_new_with_label("Install"); auto *ia=new ExtAction{b,ie}; g_signal_connect_data(ib,"clicked",G_CALLBACK(install_extension_clicked),ia,+[](gpointer p,GClosure*){delete static_cast<ExtAction*>(p);},GConnectFlags(0)); gtk_box_append(GTK_BOX(ir),ie);gtk_box_append(GTK_BOX(ir),ib);gtk_box_append(GTK_BOX(exts),ir);
     GtkWidget *rr=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8); GtkWidget *re=gtk_entry_new(); gtk_widget_set_hexpand(re,TRUE); gtk_entry_set_placeholder_text(GTK_ENTRY(re),"Extension name or ID to remove"); GtkWidget *rb=gtk_button_new_with_label("Remove"); auto *ra=new ExtAction{b,re};g_signal_connect_data(rb,"clicked",G_CALLBACK(remove_extension_clicked),ra,+[](gpointer p,GClosure*){delete static_cast<ExtAction*>(p);},GConnectFlags(0));gtk_box_append(GTK_BOX(rr),re);gtk_box_append(GTK_BOX(rr),rb);gtk_box_append(GTK_BOX(exts),rr);
     GtkWidget *warning=gtk_label_new("Extensions run right after install; reload open tabs to apply content scripts. Firefox API compatibility is still evolving.");gtk_label_set_wrap(GTK_LABEL(warning),TRUE);gtk_widget_add_css_class(warning,"dim-label");gtk_widget_set_halign(warning,GTK_ALIGN_START);gtk_box_append(GTK_BOX(exts),warning);
-    GtkWidget *privacy=page("Privacy"); settings_section("Privacy & security", "Privacy controls will be expanded as the underlying WebKit controls are wired up.",privacy);
+    GtkWidget *privacy=page("Privacy"); settings_section("Privacy & security", "Tracking prevention (WebKit ITP) is always on. Private tabs keep no history or site data.",privacy);
+    if (b->filters) {
+        settings_section("Ad & tracker blocking", "Filter lists are downloaded automatically and compiled into WebKit's native content blocker (the same engine Safari uses). Cosmetic filtering and network blocking both work; scripting-based filters (scriptlets) do not yet.", privacy);
+        for (auto &l : FilterManager::catalog()) {
+            GtkWidget *cb = gtk_check_button_new_with_label((l.name + " - " + l.description).c_str());
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(cb), b->filters->enabled(l.id));
+            g_object_set_data_full(G_OBJECT(cb), "list-id", g_strdup(l.id.c_str()), g_free);
+            g_signal_connect(cb, "toggled", G_CALLBACK(+[](GtkCheckButton *c, gpointer d) {
+                static_cast<Browser *>(d)->filters->set_enabled(static_cast<const char *>(g_object_get_data(G_OBJECT(c), "list-id")), gtk_check_button_get_active(c));
+            }), b);
+            gtk_box_append(GTK_BOX(privacy), cb);
+        }
+        GtkWidget *upd = gtk_button_new_with_label("Update filter lists now"); gtk_widget_set_halign(upd, GTK_ALIGN_START);
+        g_signal_connect(upd, "clicked", G_CALLBACK(+[](GtkButton *, gpointer d) { static_cast<Browser *>(d)->filters->refresh(true); }), b);
+        gtk_box_append(GTK_BOX(privacy), upd);
+        GtkWidget *mylbl = gtk_label_new("My filters (Adblock Plus / uBlock syntax, one per line, e.g.  ||ads.example.com^  or  example.com##.banner)"); gtk_widget_set_halign(mylbl, GTK_ALIGN_START); gtk_label_set_wrap(GTK_LABEL(mylbl), TRUE);
+        gtk_box_append(GTK_BOX(privacy), mylbl);
+        GtkWidget *tv = gtk_text_view_new(); gtk_text_view_set_monospace(GTK_TEXT_VIEW(tv), TRUE);
+        gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(tv)), b->filters->user_filters().c_str(), -1);
+        GtkWidget *tsc = gtk_scrolled_window_new(); gtk_widget_set_size_request(tsc, -1, 120); gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(tsc), tv);
+        gtk_box_append(GTK_BOX(privacy), tsc);
+        GtkWidget *save = gtk_button_new_with_label("Save my filters"); gtk_widget_set_halign(save, GTK_ALIGN_START);
+        g_object_set_data(G_OBJECT(save), "tv", tv);
+        g_signal_connect(save, "clicked", G_CALLBACK(+[](GtkButton *btn, gpointer d) {
+            GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(g_object_get_data(G_OBJECT(btn), "tv")));
+            GtkTextIter a; GtkTextIter e2; gtk_text_buffer_get_bounds(buf, &a, &e2);
+            char *t = gtk_text_buffer_get_text(buf, &a, &e2, FALSE);
+            static_cast<Browser *>(d)->filters->set_user_filters(t); g_free(t);
+        }), b);
+        gtk_box_append(GTK_BOX(privacy), save);
+        GtkWidget *tip = gtk_label_new("Tip: use the main menu item \"Turn ad blocking on/off for this site\" if a page breaks."); gtk_widget_set_halign(tip, GTK_ALIGN_START); gtk_widget_add_css_class(tip, "dim-label");
+        gtk_box_append(GTK_BOX(privacy), tip);
+    }
     GtkWidget *about=page("About"); GtkWidget *abt=gtk_label_new("ReedBrowser");gtk_widget_add_css_class(abt,"title-1");gtk_widget_set_halign(abt,GTK_ALIGN_START);gtk_box_append(GTK_BOX(about),abt);GtkWidget *desc=gtk_label_new("A native GTK4 + WebKitGTK browser.");gtk_widget_set_halign(desc,GTK_ALIGN_START);gtk_box_append(GTK_BOX(about),desc);
     // Settings search filters navigation pages by their visible page names.
     g_signal_connect(search,"search-changed",G_CALLBACK(+[](GtkSearchEntry *entry,gpointer d){GtkNotebook *nb=GTK_NOTEBOOK(d);const char*q=gtk_editable_get_text(GTK_EDITABLE(entry));std::string query=q?q:"";std::transform(query.begin(),query.end(),query.begin(),[](unsigned char c){return std::tolower(c);});if(query.empty())return;for(int i=0;i<gtk_notebook_get_n_pages(nb);++i){GtkWidget *tab=gtk_notebook_get_tab_label(nb,gtk_notebook_get_nth_page(nb,i));const char*t=GTK_IS_LABEL(tab)?gtk_label_get_text(GTK_LABEL(tab)):"";std::string name=t?t:"";std::transform(name.begin(),name.end(),name.begin(),[](unsigned char c){return std::tolower(c);});if(name.find(query)!=std::string::npos){gtk_notebook_set_current_page(nb,i);break;}}}),pages);
@@ -1441,6 +1511,11 @@ static gboolean on_decide_policy(WebKitWebView *view, WebKitPolicyDecision *deci
             webkit_policy_decision_ignore(decision); queue_reed_action(b, "xpi", 0, uri); return TRUE;
         }
         set_site_user_agent(view, uri);
+        if (type == WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION && webkit_navigation_action_get_frame_name(na) == nullptr) {
+            // main-frame navigation: (de)activate the lists for the destination site before it loads
+            bool had = !tab->list_filters.empty(), want = b->filters && !b->filters->blocking_off(host_of(uri));
+            if (had != want || (want && !had)) apply_lists(b, tab, host_of(uri));
+        }
     } else if (type == WEBKIT_POLICY_DECISION_TYPE_RESPONSE && !tab->private_mode) {
         WebKitResponsePolicyDecision *rd = WEBKIT_RESPONSE_POLICY_DECISION(decision);
         WebKitURIResponse *resp = webkit_response_policy_decision_get_response(rd);
@@ -1640,6 +1715,19 @@ static void rebuild_bookmark_bar(Browser *b) {
     gtk_widget_set_visible(b->bookmark_bar, pref == "1");  // hidden unless the user turned it on
 }
 
+static void toggle_site_blocking(Browser *b) {
+    Tab *tab = active_tab(b);
+    if (!tab || !b->filters) return;
+    const char *u = webkit_web_view_get_uri(tab->view);
+    std::string host = host_of(u ? u : "");
+    if (host.empty()) { set_status(b, "Open a website first."); return; }
+    bool off = !b->filters->blocking_off(host);
+    b->filters->set_blocking_off(host, off);
+    apply_lists(b, tab, host);
+    webkit_web_view_reload(tab->view);
+    set_status(b, off ? "Ad blocking is OFF for " + host : "Ad blocking is ON for " + host);
+}
+
 static void toggle_bookmark_bar(Browser *b) {
     bool now = gtk_widget_get_visible(b->bookmark_bar);
     b->store.set_meta("bookmark_bar", now ? "0" : "1");
@@ -1767,6 +1855,7 @@ static void on_menu_action(GtkButton *button, gpointer data) {
     else if (action == 12) print_page(b);
     else if (action == 13) view_source(b);
     else if (action == 14) toggle_fullscreen(b);
+    else if (action == 15) toggle_site_blocking(b);
     else set_theme(b, "system");
     GtkWidget *p = gtk_widget_get_parent(GTK_WIDGET(button)); if (p) p = gtk_widget_get_parent(p); if (p && GTK_IS_POPOVER(p)) gtk_popover_popdown(GTK_POPOVER(p));
 }
@@ -1848,7 +1937,7 @@ static void activate(GtkApplication *app, gpointer data) {
     gtk_widget_set_tooltip_text(menu_button, "ReedBrowser menu");
     GtkWidget *popover = gtk_popover_new(); GtkWidget *menu_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
     gtk_widget_set_margin_start(menu_box, 8); gtk_widget_set_margin_end(menu_box, 8); gtk_widget_set_margin_top(menu_box, 8); gtk_widget_set_margin_bottom(menu_box, 8);
-    const char *menu_labels[] = {"New tab", "New private tab", "Settings & extensions", "Dark mode", "System theme", "Bookmarks (Ctrl+Shift+O)", "Import bookmarks…", "Extensions", "Downloads (Ctrl+J)", "Reopen closed tab (Ctrl+Shift+T)", "Show/hide bookmarks bar (Ctrl+Shift+B)", "History (Ctrl+H)", "Print (Ctrl+P)", "View page source (Ctrl+U)", "Full screen (F11)"};
+    const char *menu_labels[] = {"New tab", "New private tab", "Settings & extensions", "Dark mode", "System theme", "Bookmarks (Ctrl+Shift+O)", "Import bookmarks…", "Extensions", "Downloads (Ctrl+J)", "Reopen closed tab (Ctrl+Shift+T)", "Show/hide bookmarks bar (Ctrl+Shift+B)", "History (Ctrl+H)", "Print (Ctrl+P)", "View page source (Ctrl+U)", "Full screen (F11)", "Turn ad blocking on/off for this site"};
     for (int i=0;i<15;i++) { GtkWidget *item=gtk_button_new_with_label(menu_labels[i]); gtk_widget_add_css_class(item,"flat"); g_object_set_data(G_OBJECT(item),"action",GINT_TO_POINTER(i)); g_signal_connect(item,"clicked",G_CALLBACK(on_menu_action),b); gtk_box_append(GTK_BOX(menu_box),item); }
     gtk_popover_set_child(GTK_POPOVER(popover),menu_box); gtk_menu_button_set_popover(GTK_MENU_BUTTON(menu_button),popover); gtk_box_append(GTK_BOX(b->toolbar),menu_button);
     g_signal_connect(b->address, "activate", G_CALLBACK(on_address_activate), b);
@@ -2089,6 +2178,7 @@ int main(int argc, char **argv) {
     webkit_network_session_set_itp_enabled(browser.normal_session, TRUE);
     connect_download_session(&browser, browser.normal_session, false);
     start_content_filter(&browser);
+    start_filter_lists(&browser);
 
     {
         Browser *bp = &browser;
@@ -2131,6 +2221,7 @@ int main(int argc, char **argv) {
         if (tab->session) g_object_unref(tab->session);
     }
     browser.ext.reset();
+    browser.filters.reset();
     if (browser.content_filter) g_object_unref(browser.content_filter);
     if (browser.filter_store) g_object_unref(browser.filter_store);
     if (browser.private_session) g_object_unref(browser.private_session);

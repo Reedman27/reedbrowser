@@ -24,7 +24,7 @@ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/gen/ext/api_js.h
   "// Generated from src/ext/api.js - do not edit.\n#pragma once\nstatic const char kReedApiJs[] = R\"REEDJS(${REED_API_JS})REEDJS\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/ext/api.js)
 
-add_executable(reedbrowser src/main.cpp src/extensions.cpp)
+add_executable(reedbrowser src/main.cpp src/extensions.cpp src/filters.cpp)
 target_include_directories(reedbrowser PRIVATE src ${CMAKE_CURRENT_BINARY_DIR}/gen)
 target_link_libraries(reedbrowser PRIVATE PkgConfig::GTK4 PkgConfig::WEBKIT PkgConfig::JSONGLIB PkgConfig::LIBARCHIVE PkgConfig::CURL SQLite::SQLite3)
 target_compile_options(reedbrowser PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
@@ -36,6 +36,9 @@ if(BUILD_TESTING)
   add_executable(test-dnr tools/test-dnr.cpp)
   target_include_directories(test-dnr PRIVATE src)
   target_link_libraries(test-dnr PRIVATE PkgConfig::WEBKIT PkgConfig::JSONGLIB)
+  add_executable(test-abp tools/test-abp.cpp)
+  target_include_directories(test-abp PRIVATE src)
+  target_link_libraries(test-abp PRIVATE PkgConfig::WEBKIT PkgConfig::JSONGLIB)
   add_test(NAME release-validation COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/validate-release.py WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   add_test(NAME dnr-conversion COMMAND test-dnr)
   # tools/test-importer.cpp needs sample Chromium/Firefox/HTML bookmark files passed as argv[1]; not registered yet.
